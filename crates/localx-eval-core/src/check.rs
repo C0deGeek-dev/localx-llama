@@ -121,10 +121,11 @@ impl CheckOutcome {
 /// output is sanitized before it becomes finding detail. There is no path
 /// around [`allow`](CommandGate::allow) — the runner asks before every spawn,
 /// including fixers and re-runs.
-pub trait CommandGate: Sync {
-    /// Decide whether the command may run. The future carries no `Send` bound so
-    /// a host whose approval flow is single-threaded (an interactive prompt) can
-    /// implement the gate; drive the runner on a current-thread or local context
+pub trait CommandGate {
+    /// Decide whether the command may run. Neither the gate nor its future
+    /// carries a `Send`/`Sync` bound, so a host whose approval flow is
+    /// single-threaded (an interactive prompt behind a non-thread-safe handle)
+    /// can implement it; drive the runner on a current-thread or local context
     /// when the gate needs it.
     fn allow(&self, command: &CheckCommand) -> impl Future<Output = bool>;
 
