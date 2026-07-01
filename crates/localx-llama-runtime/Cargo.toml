@@ -18,4 +18,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
 dunce = { workspace = true }
-# tokio/axum/hyper/reqwest/sysinfo land with the boxes that use them.
+axum = { workspace = true }
+reqwest = { workspace = true }
+# sysinfo/netstat-class dep lands with port->PID reaping.
+
+[dev-dependencies]
+tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }

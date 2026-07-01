@@ -4,5 +4,7 @@
 Cargo.lock.orig
 .DS_Store
 
-# Library crate tier — resolved fresh by consumers (which pin by git rev).
-Cargo.lock
+# Cargo.lock IS committed here (not the usual lib convention): the MSRV-1.82
+# build needs the exact transitive pins that dodge edition-2024/rustc-1.85
+# dependencies (idna_adapter, zeroize, hyper-rustls, rustls, ...). CI resolves
+# against this lock so the matrix stays reproducible.
