@@ -1,0 +1,15 @@
+[package]
+name = "localx-eval-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Host-neutral evaluation primitives extracted from LocalPilot's harness: scorecard, blind judge, ablation attribution, and the stack-detected build/test grader — shared by LocalPilot and LocalBench."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Filled in subject 03 when the scorecard/judge/ablation + grader move here.

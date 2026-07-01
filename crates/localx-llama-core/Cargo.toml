@@ -1,0 +1,15 @@
+[package]
+name = "localx-llama-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Pure, host-neutral llama.cpp domain: model definitions, llama-server argv builder, VRAM/quant-fit math, config precedence, and the tuner/AutoBest schema."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Filled in subject 01 (serde/serde_json/thiserror) as the domain lands.

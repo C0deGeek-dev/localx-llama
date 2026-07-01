@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pdb
+Cargo.lock.orig
+.DS_Store
+
+# Library crate tier — resolved fresh by consumers (which pin by git rev).
+Cargo.lock

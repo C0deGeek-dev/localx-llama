@@ -1,0 +1,15 @@
+[package]
+name = "localx-llama-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Process/network side of the llama.cpp stack: llama-server lifecycle, pin-verified download/install, CPU-only embed-serve, and the in-process no-think streaming filter — all behind cross-platform traits."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Filled in subject 02 (tokio/axum/hyper/reqwest/sysinfo/dunce/sha2) as the runtime lands.
