@@ -17,10 +17,14 @@
 pub mod download;
 pub mod error;
 pub mod health;
+pub mod net;
 pub mod nothink;
 pub mod probe;
+pub mod spawn;
 
 pub use error::RuntimeError;
 pub use health::{HealthState, ProxyAction, ProxyTarget};
+pub use net::{free_port, is_port_free, is_port_listening};
 pub use nothink::{strip_think, ThinkStripper, EMPTY_AFTER_THINK};
 pub use probe::SystemProbe;
+pub use spawn::{simplify_cwd, spawn_detached};
