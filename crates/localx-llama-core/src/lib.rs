@@ -15,12 +15,17 @@
 pub mod args;
 pub mod config;
 pub mod error;
+pub mod launcher;
 pub mod model;
 pub mod quant;
 pub mod tuner;
 pub mod vram;
 
 pub use error::CoreError;
+pub use launcher::{
+    assert_compatible, discover_root, BackendSession, KvTypes, Launcher, LauncherError,
+    LauncherVersion, RUNTIME_LLAMACPP, TARGET_LOCALBOX,
+};
 pub use model::{Mode, ModelDef, QuantEntry};
 pub use tuner::{Overrides, TunerBestConfig, TunerEntry, TUNER_SCHEMA};
 pub use vram::{FitClass, HardwareProbe, VramInfo, VramSource};
