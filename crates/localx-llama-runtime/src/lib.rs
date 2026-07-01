@@ -1,19 +1,21 @@
 //! Process and network side of the llama.cpp stack, shared across LocalX.
 //!
-//! Everything with I/O sits behind traits so the crate stays cross-platform:
-//! `llama-server` lifecycle, pin-verified install/download with CUDA-driver
-//! matching, the CPU-only embed-serve sibling, and the no-think streaming filter
-//! (an in-process replacement for the python sidecar — see subject 00.5, which
-//! confirmed axum/hyper build on MSRV 1.82).
+//! Everything with I/O sits behind traits/thin shells so the crate stays
+//! cross-platform and the domain logic stays unit-testable:
 //!
-//! Subject 02 fills this in; hardware/process/port access is injected per-OS.
+//! - [`probe`] — hardware probe (nvidia-smi VRAM/GPU names, logical cores),
+//!   implementing `localx_llama_core::HardwareProbe`.
+//! - [`nothink`] — the no-think filter (streaming `<think>` strip, root-only key
+//!   strip, system-message merge, `[no output]` fallback) — the in-process
+//!   replacement for the python sidecar (subject 00.5 confirmed axum on 1.82).
+//!
+//! Server lifecycle, verified download/install, embed-serve, and the axum proxy
+//! wiring land in later boxes of this subject.
 
 #![forbid(unsafe_code)]
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub mod nothink;
+pub mod probe;
+
+pub use nothink::{strip_think, ThinkStripper, EMPTY_AFTER_THINK};
+pub use probe::SystemProbe;

@@ -12,4 +12,8 @@ description = "Process/network side of the llama.cpp stack: llama-server lifecyc
 workspace = true
 
 [dependencies]
-# Filled in subject 02 (tokio/axum/hyper/reqwest/sysinfo/dunce/sha2) as the runtime lands.
+localx-llama-core = { path = "../localx-llama-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# tokio/axum/hyper/reqwest/sysinfo/dunce/sha2 land with the boxes that use them.
