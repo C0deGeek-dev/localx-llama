@@ -1,0 +1,6 @@
+# LF everywhere (repo-hygiene: Rust repo, tier-1 on Linux/macOS too).
+* text=auto eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
