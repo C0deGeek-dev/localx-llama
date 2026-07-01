@@ -7,7 +7,7 @@
 //!   implementing `localx_llama_core::HardwareProbe`.
 //! - [`nothink`] — the no-think filter (streaming `<think>` strip, root-only key
 //!   strip, system-message merge, `[no output]` fallback) — the in-process
-//!   replacement for the python sidecar (subject 00.5 confirmed axum on 1.82).
+//!   replacement for the python sidecar (axum was spike-proven on Rust 1.82).
 //!
 //! Server lifecycle, verified download/install, embed-serve, and the axum proxy
 //! wiring land in later boxes of this subject.
