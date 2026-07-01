@@ -43,7 +43,7 @@ pub use check::{
 };
 pub use discipline::DisciplineMetrics;
 pub use gate::{parse_provenance, GateCard, Provenance, Safety, Verdict};
-pub use grade::{count_tests, grade, GradeOutcome, Lang};
+pub use grade::{count_tests, count_tests_generic, grade, GradeOutcome, Lang};
 pub use judge::{
     blind, cohens_kappa, judge_prompt, parse_judge_block, parse_preference, preference_prompt,
     ranking_verdict, resolve_preference, BlindedPair, Judge, JudgeBlock, JudgeCache, JudgeError,
