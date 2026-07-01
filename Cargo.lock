@@ -617,6 +617,10 @@ checksum = "23fb14cb19457329c82206317a5663005a4d404783dc74f4252769b0d5f42856"
 [[package]]
 name = "localx-eval-core"
 version = "0.1.0"
+dependencies = [
+ "regex",
+ "serde",
+]
 
 [[package]]
 name = "localx-llama-core"

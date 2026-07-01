@@ -12,4 +12,5 @@ description = "Host-neutral evaluation primitives extracted from LocalPilot's ha
 workspace = true
 
 [dependencies]
-# Filled in subject 03 when the scorecard/judge/ablation + grader move here.
+serde = { workspace = true }
+regex = { workspace = true }
