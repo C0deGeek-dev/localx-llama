@@ -21,7 +21,7 @@ dunce = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
-# a netstat-class dep for socket->PID reaping is deferred to the app layer (see plan).
+# a netstat-class dep for socket->PID reaping lands with the consuming app layer.
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
