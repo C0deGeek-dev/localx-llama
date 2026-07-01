@@ -20,8 +20,8 @@ sha2 = { workspace = true }
 dunce = { workspace = true }
 axum = { workspace = true }
 reqwest = { workspace = true }
-# sysinfo/netstat-class dep lands with port->PID reaping.
+tokio = { workspace = true }
+# a netstat-class dep for socket->PID reaping is deferred to the app layer (see plan).
 
 [dev-dependencies]
-tokio = { workspace = true }
 tower = { workspace = true, features = ["util"] }

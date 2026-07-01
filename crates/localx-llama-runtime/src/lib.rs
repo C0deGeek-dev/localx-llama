@@ -21,6 +21,7 @@ pub mod net;
 pub mod nothink;
 pub mod probe;
 pub mod proxy;
+pub mod server;
 pub mod spawn;
 
 pub use error::RuntimeError;
@@ -29,4 +30,5 @@ pub use net::{free_port, is_port_free, is_port_listening};
 pub use nothink::{strip_think, ThinkStripper, EMPTY_AFTER_THINK};
 pub use probe::SystemProbe;
 pub use proxy::{ProxyConfig, ProxyState, ReqwestUpstream, Upstream};
+pub use server::{embed_server_args, resolve_server_binary, wait_for_port};
 pub use spawn::{simplify_cwd, spawn_detached};
