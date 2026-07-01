@@ -15,8 +15,10 @@
 pub mod args;
 pub mod error;
 pub mod model;
+pub mod tuner;
 pub mod vram;
 
 pub use error::CoreError;
 pub use model::{Mode, ModelDef, QuantEntry};
+pub use tuner::{Overrides, TunerBestConfig, TunerEntry, TUNER_SCHEMA};
 pub use vram::{FitClass, HardwareProbe, VramInfo, VramSource};
