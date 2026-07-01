@@ -71,6 +71,8 @@ pub enum HealthState {
     Ok,
     /// Proxy up but upstream down — requests get a bare 502 (stale proxy).
     StaleProxy,
+    /// Upstream up but the proxy is not running.
+    ProxyDown,
     /// Nothing serving.
     Down,
 }
@@ -80,7 +82,8 @@ pub fn classify_health(proxy_up: bool, upstream_up: bool) -> HealthState {
     match (proxy_up, upstream_up) {
         (true, true) => HealthState::Ok,
         (true, false) => HealthState::StaleProxy,
-        (false, _) => HealthState::Down,
+        (false, true) => HealthState::ProxyDown,
+        (false, false) => HealthState::Down,
     }
 }
 
@@ -88,7 +91,24 @@ pub fn classify_health(proxy_up: bool, upstream_up: bool) -> HealthState {
 pub fn remediation(state: HealthState) -> &'static str {
     match state {
         HealthState::Ok => "",
-        HealthState::StaleProxy | HealthState::Down => "llmstop; llmdefaultserve",
+        HealthState::Down => "llmdefaultserve",
+        HealthState::StaleProxy | HealthState::ProxyDown => "llmstop; llmdefaultserve",
+    }
+}
+
+/// The operator-facing description of a non-Ok health state, with the ports.
+pub fn health_description(state: HealthState, proxy_port: u16, upstream_port: u16) -> String {
+    match state {
+        HealthState::Ok => String::new(),
+        HealthState::StaleProxy => format!(
+            "The no-think proxy is up on {proxy_port} but the upstream model server on              {upstream_port} is down, so requests return a bare 502."
+        ),
+        HealthState::ProxyDown => format!(
+            "The model server on {upstream_port} is up but the no-think proxy on              {proxy_port} is not running."
+        ),
+        HealthState::Down => {
+            "Neither the no-think proxy nor the model server is running.".to_string()
+        }
     }
 }
 
@@ -151,12 +171,26 @@ mod tests {
     fn health_matrix_and_remediation() {
         assert_eq!(classify_health(true, true), HealthState::Ok);
         assert_eq!(classify_health(true, false), HealthState::StaleProxy);
-        assert_eq!(classify_health(false, true), HealthState::Down);
+        assert_eq!(classify_health(false, false), HealthState::Down);
         assert_eq!(remediation(HealthState::Ok), "");
         assert_eq!(
             remediation(HealthState::StaleProxy),
             "llmstop; llmdefaultserve"
         );
-        assert_eq!(remediation(HealthState::Down), "llmstop; llmdefaultserve");
+        assert_eq!(remediation(HealthState::Down), "llmdefaultserve");
+    }
+
+    #[test]
+    fn health_distinguishes_proxy_down_from_fully_down() {
+        assert_eq!(classify_health(false, true), HealthState::ProxyDown);
+        assert_eq!(classify_health(false, false), HealthState::Down);
+        assert_eq!(
+            remediation(HealthState::ProxyDown),
+            "llmstop; llmdefaultserve"
+        );
+        assert_eq!(remediation(HealthState::Down), "llmdefaultserve");
+        let text = health_description(HealthState::ProxyDown, 11435, 8080);
+        assert!(text.contains("8080 is up"));
+        assert!(text.contains("11435 is not running"));
     }
 }
