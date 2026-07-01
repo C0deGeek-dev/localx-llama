@@ -34,8 +34,13 @@ impl Mode {
 }
 
 /// A single quant variant of a model (one GGUF file).
+///
+/// The catalog writes this in two spellings — the compact `"key": "file.gguf"`
+/// and the table `{ "File": ..., "SizeGB": ..., "Note": ... }` — so it
+/// deserializes from either ([`QuantEntryRepr`] does the accepting) and always
+/// serializes as the table.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", from = "QuantEntryRepr")]
 pub struct QuantEntry {
     /// GGUF filename within the model repo.
     #[serde(default)]
@@ -48,6 +53,44 @@ pub struct QuantEntry {
     pub note: Option<String>,
 }
 
+/// The two catalog spellings of a quant variant.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum QuantEntryRepr {
+    /// `"quant-key": "file.gguf"`.
+    File(String),
+    /// `"quant-key": { "File": ..., "SizeGB": ..., "Note": ... }`.
+    Table {
+        #[serde(rename = "File", default)]
+        file: String,
+        #[serde(rename = "SizeGB", default)]
+        size_gb: Option<f64>,
+        #[serde(rename = "Note", default)]
+        note: Option<String>,
+    },
+}
+
+impl From<QuantEntryRepr> for QuantEntry {
+    fn from(repr: QuantEntryRepr) -> Self {
+        match repr {
+            QuantEntryRepr::File(file) => QuantEntry {
+                file,
+                size_gb: None,
+                note: None,
+            },
+            QuantEntryRepr::Table {
+                file,
+                size_gb,
+                note,
+            } => QuantEntry {
+                file,
+                size_gb,
+                note,
+            },
+        }
+    }
+}
+
 /// A model definition as stored in the catalog.
 ///
 /// Optional-but-typed fields mirror the launcher's `Contains`-guarded reads:
@@ -57,6 +100,15 @@ pub struct QuantEntry {
 pub struct ModelDef {
     /// HuggingFace repo id (`owner/name`).
     pub repo: String,
+    /// On-disk folder name under the GGUF root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    /// Single-file models: the GGUF filename (models with `quants` use those).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Human display name shown in pickers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// Quant key -> variant. May be empty for models that don't support switching.
     #[serde(default)]
     pub quants: BTreeMap<String, QuantEntry>,
@@ -357,5 +409,40 @@ mod tests {
         assert_eq!(d.contexts[""], 65536);
         assert_eq!(d.kv_cache_k.as_deref(), Some("q8_0"));
         assert_eq!(d.vision_module.as_deref(), Some("proj"));
+    }
+
+    #[test]
+    fn parses_the_real_catalog_entry_shape() {
+        // The shipping catalog spells quants compactly ("key": "file.gguf")
+        // and carries Root/DisplayName — the launcher parses it as-is.
+        let json = r#"{
+            "DisplayName": "Qwen 3.6 35B A3B uncensored heretic APEX GGUF",
+            "Root": "q3635ba3bapex",
+            "SourceType": "gguf",
+            "Repo": "mudler/Qwen3.6-35B-A3B-uncensored-heretic-APEX-GGUF",
+            "Quants": {
+                "apex-balanced": "Qwen3.6-35B-A3B-uncensored-heretic-APEX-Balanced.gguf",
+                "apex-i-quality": { "File": "Qwen3.6-35B-A3B-uncensored-heretic-APEX-I-Quality.gguf", "SizeGB": 21.3 }
+            },
+            "Quant": "apex-balanced",
+            "Parser": "qwen36",
+            "Contexts": { "": 32768, "64k": 65536 }
+        }"#;
+        let def: ModelDef = serde_json::from_str(json).unwrap();
+        assert_eq!(def.root.as_deref(), Some("q3635ba3bapex"));
+        assert_eq!(
+            def.display_name.as_deref(),
+            Some("Qwen 3.6 35B A3B uncensored heretic APEX GGUF")
+        );
+        // Compact spelling parses to a bare filename...
+        assert_eq!(
+            def.quants["apex-balanced"].file,
+            "Qwen3.6-35B-A3B-uncensored-heretic-APEX-Balanced.gguf"
+        );
+        assert_eq!(def.quants["apex-balanced"].size_gb, None);
+        // ...and the table spelling carries its size.
+        assert_eq!(def.quants["apex-i-quality"].size_gb, Some(21.3));
+        // Unknown catalog fields (SourceType) are tolerated, not errors.
+        assert_eq!(def.contexts[""], 32768);
     }
 }
