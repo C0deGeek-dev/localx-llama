@@ -122,8 +122,11 @@ impl CheckOutcome {
 /// around [`allow`](CommandGate::allow) — the runner asks before every spawn,
 /// including fixers and re-runs.
 pub trait CommandGate: Sync {
-    /// Decide whether the command may run.
-    fn allow(&self, command: &CheckCommand) -> impl Future<Output = bool> + Send;
+    /// Decide whether the command may run. The future carries no `Send` bound so
+    /// a host whose approval flow is single-threaded (an interactive prompt) can
+    /// implement the gate; drive the runner on a current-thread or local context
+    /// when the gate needs it.
+    fn allow(&self, command: &CheckCommand) -> impl Future<Output = bool>;
 
     /// Sanitize captured output before it becomes finding detail (e.g. secret
     /// redaction). The default keeps it as-is.
@@ -138,7 +141,7 @@ pub trait CommandGate: Sync {
 pub struct AllowAll;
 
 impl CommandGate for AllowAll {
-    fn allow(&self, _command: &CheckCommand) -> impl Future<Output = bool> + Send {
+    fn allow(&self, _command: &CheckCommand) -> impl Future<Output = bool> {
         std::future::ready(true)
     }
 }
@@ -302,7 +305,7 @@ mod tests {
     /// A gate that refuses everything.
     struct DenyAll;
     impl CommandGate for DenyAll {
-        fn allow(&self, _command: &CheckCommand) -> impl Future<Output = bool> + Send {
+        fn allow(&self, _command: &CheckCommand) -> impl Future<Output = bool> {
             std::future::ready(false)
         }
     }
@@ -310,7 +313,7 @@ mod tests {
     /// A gate that stamps sanitized output, proving sanitize runs pre-bound.
     struct Stamping;
     impl CommandGate for Stamping {
-        fn allow(&self, _command: &CheckCommand) -> impl Future<Output = bool> + Send {
+        fn allow(&self, _command: &CheckCommand) -> impl Future<Output = bool> {
             std::future::ready(true)
         }
         fn sanitize(&self, text: String) -> String {
