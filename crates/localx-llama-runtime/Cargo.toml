@@ -16,4 +16,5 @@ localx-llama-core = { path = "../localx-llama-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-# tokio/axum/hyper/reqwest/sysinfo/dunce/sha2 land with the boxes that use them.
+sha2 = { workspace = true }
+# tokio/axum/hyper/reqwest/sysinfo/dunce land with the boxes that use them.

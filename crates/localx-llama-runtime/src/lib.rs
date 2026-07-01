@@ -14,8 +14,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod download;
+pub mod error;
+pub mod health;
 pub mod nothink;
 pub mod probe;
 
+pub use error::RuntimeError;
+pub use health::{HealthState, ProxyAction, ProxyTarget};
 pub use nothink::{strip_think, ThinkStripper, EMPTY_AFTER_THINK};
 pub use probe::SystemProbe;
