@@ -12,4 +12,8 @@ description = "Pure, host-neutral llama.cpp domain: model definitions, llama-ser
 workspace = true
 
 [dependencies]
-# Filled in subject 01 (serde/serde_json/thiserror) as the domain lands.
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
