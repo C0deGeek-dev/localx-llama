@@ -13,8 +13,10 @@
 #![forbid(unsafe_code)]
 
 pub mod args;
+pub mod config;
 pub mod error;
 pub mod model;
+pub mod quant;
 pub mod tuner;
 pub mod vram;
 

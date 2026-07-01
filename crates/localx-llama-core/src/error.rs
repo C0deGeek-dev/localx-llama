@@ -38,4 +38,8 @@ pub enum CoreError {
     /// Consolidated model-definition validation failure (all field errors at once).
     #[error("model definition invalid:\n{0}")]
     Validation(String),
+
+    /// An attempt to set a catalog-only key (`Models`/`CommandAliases`) in settings.
+    #[error("'{0}' comes from the catalog and cannot be set as a per-machine setting")]
+    CatalogOnly(String),
 }
