@@ -91,8 +91,10 @@ pub fn classify_health(proxy_up: bool, upstream_up: bool) -> HealthState {
 pub fn remediation(state: HealthState) -> &'static str {
     match state {
         HealthState::Ok => "",
-        HealthState::Down => "llmdefaultserve",
-        HealthState::StaleProxy | HealthState::ProxyDown => "llmstop; llmdefaultserve",
+        HealthState::Down => "localbox serve <model>",
+        HealthState::StaleProxy | HealthState::ProxyDown => {
+            "localbox stop, then localbox serve <model>"
+        }
     }
 }
 
@@ -101,10 +103,12 @@ pub fn health_description(state: HealthState, proxy_port: u16, upstream_port: u1
     match state {
         HealthState::Ok => String::new(),
         HealthState::StaleProxy => format!(
-            "The no-think proxy is up on {proxy_port} but the upstream model server on              {upstream_port} is down, so requests return a bare 502."
+            "The no-think proxy is up on {proxy_port} but the upstream model server on \
+             {upstream_port} is down, so requests return a bare 502."
         ),
         HealthState::ProxyDown => format!(
-            "The model server on {upstream_port} is up but the no-think proxy on              {proxy_port} is not running."
+            "The model server on {upstream_port} is up but the no-think proxy on \
+             {proxy_port} is not running."
         ),
         HealthState::Down => {
             "Neither the no-think proxy nor the model server is running.".to_string()
@@ -175,9 +179,9 @@ mod tests {
         assert_eq!(remediation(HealthState::Ok), "");
         assert_eq!(
             remediation(HealthState::StaleProxy),
-            "llmstop; llmdefaultserve"
+            "localbox stop, then localbox serve <model>"
         );
-        assert_eq!(remediation(HealthState::Down), "llmdefaultserve");
+        assert_eq!(remediation(HealthState::Down), "localbox serve <model>");
     }
 
     #[test]
@@ -186,9 +190,9 @@ mod tests {
         assert_eq!(classify_health(false, false), HealthState::Down);
         assert_eq!(
             remediation(HealthState::ProxyDown),
-            "llmstop; llmdefaultserve"
+            "localbox stop, then localbox serve <model>"
         );
-        assert_eq!(remediation(HealthState::Down), "llmdefaultserve");
+        assert_eq!(remediation(HealthState::Down), "localbox serve <model>");
         let text = health_description(HealthState::ProxyDown, 11435, 8080);
         assert!(text.contains("8080 is up"));
         assert!(text.contains("11435 is not running"));
