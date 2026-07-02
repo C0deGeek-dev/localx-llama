@@ -33,6 +33,9 @@ pub enum ProxyError {
     /// The upstream request failed.
     #[error("upstream request failed: {0}")]
     Upstream(String),
+    /// The proxy could not bind or serve its listen socket.
+    #[error("proxy listen failed: {0}")]
+    Listen(String),
 }
 
 /// A buffered upstream response.
@@ -125,6 +128,25 @@ fn status_body(status: StatusCode, msg: &str) -> Response {
     let mut r = Response::new(Body::from(msg.to_string()));
     *r.status_mut() = status;
     r
+}
+
+/// Bind loopback `listen_port` and run the no-think proxy until the process
+/// exits, forwarding to the upstream named in `config`.
+///
+/// # Errors
+/// [`ProxyError::Listen`] when the socket cannot be bound or serving fails.
+pub async fn serve_proxy(listen_port: u16, config: ProxyConfig) -> Result<(), ProxyError> {
+    let upstream = ReqwestUpstream::new(format!(
+        "http://{}:{}",
+        config.target_host, config.target_port
+    ));
+    let state = Arc::new(ProxyState { upstream, config });
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", listen_port))
+        .await
+        .map_err(|e| ProxyError::Listen(format!("127.0.0.1:{listen_port}: {e}")))?;
+    axum::serve(listener, router(state))
+        .await
+        .map_err(|e| ProxyError::Listen(e.to_string()))
 }
 
 /// Production upstream over reqwest (loopback llama-server).
@@ -247,5 +269,57 @@ mod tests {
         assert_eq!(v["target_host"], json!("127.0.0.1"));
         assert_eq!(v["target_port"], json!(8080));
         assert_eq!(v["status"], json!("ok"));
+    }
+
+    #[tokio::test]
+    async fn serve_proxy_binds_and_answers_health_over_a_real_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let server = tokio::spawn(serve_proxy(
+            port,
+            ProxyConfig {
+                target_host: "127.0.0.1".into(),
+                target_port: 8080,
+                merge_system: true,
+            },
+        ));
+
+        let url = format!("http://127.0.0.1:{port}/health");
+        let mut last_err = String::new();
+        let mut answered = None;
+        for _ in 0..50 {
+            match reqwest::get(&url).await {
+                Ok(resp) => {
+                    answered = Some(resp.json::<Value>().await.unwrap());
+                    break;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        }
+        let v = answered.unwrap_or_else(|| panic!("proxy never answered /health: {last_err}"));
+        assert_eq!(v["target_port"], json!(8080));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn serve_proxy_reports_a_bind_conflict() {
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let err = serve_proxy(
+            port,
+            ProxyConfig {
+                target_host: "127.0.0.1".into(),
+                target_port: 8080,
+                merge_system: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ProxyError::Listen(_)));
     }
 }
