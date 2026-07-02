@@ -66,6 +66,10 @@ pub struct ProxyConfig {
     pub target_port: u16,
     /// Fold mid-conversation system messages into the top-level `system`.
     pub merge_system: bool,
+    /// When set, every non-`/health` request must carry this bearer token —
+    /// the LAN-gateway posture (a public bind without a key is refused by
+    /// the launcher's serve guard before the proxy ever starts).
+    pub api_key: Option<String>,
 }
 
 /// Shared proxy state.
@@ -97,6 +101,22 @@ async fn proxy_handler<U: Upstream>(
     State(state): State<Arc<ProxyState<U>>>,
     req: axum::extract::Request,
 ) -> Response {
+    if let Some(expected) = &state.config.api_key {
+        let authorized = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .is_some_and(|token| token == expected)
+            || req
+                .headers()
+                .get("x-api-key")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|token| token == expected);
+        if !authorized {
+            return status_body(StatusCode::UNAUTHORIZED, "missing or wrong api key");
+        }
+    }
     let path = req.uri().path().to_string();
 
     let bytes = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
@@ -136,14 +156,27 @@ fn status_body(status: StatusCode, msg: &str) -> Response {
 /// # Errors
 /// [`ProxyError::Listen`] when the socket cannot be bound or serving fails.
 pub async fn serve_proxy(listen_port: u16, config: ProxyConfig) -> Result<(), ProxyError> {
+    serve_proxy_on("127.0.0.1", listen_port, config).await
+}
+
+/// [`serve_proxy`] with an explicit listen host (`0.0.0.0` for a LAN
+/// gateway; pair a public bind with `api_key`).
+///
+/// # Errors
+/// [`ProxyError::Listen`] when the socket cannot be bound or serving fails.
+pub async fn serve_proxy_on(
+    listen_host: &str,
+    listen_port: u16,
+    config: ProxyConfig,
+) -> Result<(), ProxyError> {
     let upstream = ReqwestUpstream::new(format!(
         "http://{}:{}",
         config.target_host, config.target_port
     ));
     let state = Arc::new(ProxyState { upstream, config });
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", listen_port))
+    let listener = tokio::net::TcpListener::bind((listen_host, listen_port))
         .await
-        .map_err(|e| ProxyError::Listen(format!("127.0.0.1:{listen_port}: {e}")))?;
+        .map_err(|e| ProxyError::Listen(format!("{listen_host}:{listen_port}: {e}")))?;
     axum::serve(listener, router(state))
         .await
         .map_err(|e| ProxyError::Listen(e.to_string()))
@@ -224,6 +257,21 @@ mod tests {
                 target_host: "127.0.0.1".into(),
                 target_port: 8080,
                 merge_system: true,
+                api_key: None,
+            },
+        })
+    }
+
+    fn keyed_state(key: &str) -> Arc<ProxyState<MockUpstream>> {
+        Arc::new(ProxyState {
+            upstream: MockUpstream {
+                last_body: Mutex::new(Vec::new()),
+            },
+            config: ProxyConfig {
+                target_host: "127.0.0.1".into(),
+                target_port: 8080,
+                merge_system: true,
+                api_key: Some(key.to_string()),
             },
         })
     }
@@ -283,6 +331,7 @@ mod tests {
                 target_host: "127.0.0.1".into(),
                 target_port: 8080,
                 merge_system: true,
+                api_key: None,
             },
         ));
 
@@ -307,6 +356,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_keyed_proxy_refuses_unauthorized_forwards_but_not_health() {
+        let app = router(keyed_state("secret"));
+        // No key: refused before any upstream contact.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Bearer and x-api-key spellings both pass.
+        for (name, value) in [("authorization", "Bearer secret"), ("x-api-key", "secret")] {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header(name, value)
+                .body(Body::from("{}"))
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // Health stays open so target checks keep working.
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn serve_proxy_reports_a_bind_conflict() {
         let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = holder.local_addr().unwrap().port();
@@ -316,6 +398,7 @@ mod tests {
                 target_host: "127.0.0.1".into(),
                 target_port: 8080,
                 merge_system: true,
+                api_key: None,
             },
         )
         .await
