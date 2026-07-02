@@ -78,6 +78,47 @@ pub async fn wait_for_port(port: u16, timeout: Duration) -> bool {
     }
 }
 
+/// The HTTP status `GET /health` on a loopback port answers right now.
+fn health_status(port: u16) -> Option<u16> {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)).ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok()?;
+    write!(
+        stream,
+        "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut buf = [0_u8; 64];
+    let read = stream.read(&mut buf).ok()?;
+    String::from_utf8_lossy(&buf[..read])
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Block until the server's `/health` answers HTTP 200, or the timeout
+/// elapses. A llama-server binds its port immediately and answers 503 while
+/// the model is still loading, so a listening socket is NOT readiness — a
+/// request sent then gets an error body instead of an answer.
+#[must_use]
+pub fn wait_for_ready(port: u16, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if health_status(port) == Some(200) {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -120,5 +161,55 @@ mod tests {
     async fn times_out_on_a_closed_port() {
         let port = crate::net::free_port().unwrap(); // released, nothing listening
         assert!(!wait_for_port(port, Duration::from_millis(300)).await);
+    }
+
+    /// A mock server answering `/health` with a scripted status sequence
+    /// (the last status repeats forever).
+    fn spawn_health_server(statuses: &'static [u16]) -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (served, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { break };
+                let status = statuses[served.min(statuses.len() - 1)];
+                let mut buf = [0_u8; 512];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let reason = if status == 200 {
+                    "OK"
+                } else {
+                    "Service Unavailable"
+                };
+                let _ = std::io::Write::write_all(
+                    &mut stream,
+                    format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                    )
+                    .as_bytes(),
+                );
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn a_listening_but_still_loading_server_is_not_ready() {
+        // 503 while the model loads, then 200: readiness waits for the 200.
+        let port = spawn_health_server(&[503, 503, 200]);
+        assert!(wait_for_ready(port, std::time::Duration::from_secs(10)));
+
+        // A server that never becomes healthy times out even though the
+        // port is listening the whole time.
+        let stuck = spawn_health_server(&[503]);
+        assert!(is_port_listening(stuck));
+        assert!(!wait_for_ready(
+            stuck,
+            std::time::Duration::from_millis(600)
+        ));
+    }
+
+    #[test]
+    fn readiness_times_out_when_nothing_listens() {
+        let port = crate::net::free_port().unwrap();
+        assert!(!wait_for_ready(port, std::time::Duration::from_millis(300)));
     }
 }
