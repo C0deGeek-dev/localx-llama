@@ -17,6 +17,29 @@ use serde_json::{Map, Value};
 /// Substituted for an assistant turn that strips to nothing.
 pub const EMPTY_AFTER_THINK: &str = "[no output]";
 
+/// Whether an SSE event is a stream terminator: OpenAI's `data: [DONE]` or
+/// Anthropic's `message_stop`. The proxy releases the think-stripper's held-back
+/// tail in-band, just before this event, so the last characters are not stranded
+/// after the marker a consumer stops reading at.
+fn is_terminal_marker(event: &str) -> bool {
+    for line in event.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let Some(payload) = trimmed.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload == "[DONE]" {
+            return true;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            if v.get("type").and_then(Value::as_str) == Some("message_stop") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// First index of `needle` in `haystack` (small-needle scan for SSE delimiters).
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
@@ -249,6 +272,20 @@ impl SseThinkFilter {
 
     fn transform_event(&mut self, event: &str) -> String {
         let mut lines: Vec<String> = Vec::new();
+        // Release the stripper's held-back tail (up to `HOLDBACK` bytes withheld
+        // for split-tag safety) as an in-band content frame *before* a stream
+        // terminator (`[DONE]` / `message_stop`). A consumer ends the stream at
+        // the terminator, so a tail emitted after it — as `finish()` alone would
+        // — is dropped, silently truncating the last few characters of every
+        // response. Flushing here puts those characters ahead of the terminator.
+        if is_terminal_marker(event) {
+            let tail = self.stripper.finish();
+            if !tail.is_empty() {
+                if let Some(frame) = self.shape.map(|s| s.data_frame(&tail)) {
+                    lines.push(frame);
+                }
+            }
+        }
         for line in event.split_inclusive('\n') {
             let trimmed = line.trim_end_matches(['\r', '\n']);
             if let Some(payload) = trimmed.strip_prefix("data:") {
@@ -564,6 +601,102 @@ mod tests {
             visible.contains("keep") && visible.contains("done"),
             "lost text: {out}"
         );
+    }
+
+    /// Visible text carried by content frames that appear *before* the first
+    /// stream terminator (`[DONE]` / `message_stop`) — what a consumer that ends
+    /// the stream at the terminator actually receives.
+    fn visible_before_terminator(sse: &str) -> String {
+        let mut text = String::new();
+        for event in sse.split_inclusive("\n\n") {
+            if is_terminal_marker(event) {
+                break;
+            }
+            for line in event.split_inclusive('\n') {
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                let Some(payload) = trimmed.strip_prefix("data:") else {
+                    continue;
+                };
+                let payload = payload.trim();
+                if payload == "[DONE]" || payload.is_empty() {
+                    continue;
+                }
+                if let Ok(v) = serde_json::from_str::<Value>(payload) {
+                    if let Some(t) = v
+                        .pointer("/choices/0/delta/content")
+                        .or_else(|| v.pointer("/delta/text"))
+                        .and_then(Value::as_str)
+                    {
+                        text.push_str(t);
+                    }
+                }
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn openai_tail_is_flushed_before_done_not_after() {
+        // The last ≤HOLDBACK chars of visible text ("or you?") were held back for
+        // split-tag safety; they must reach the client *before* [DONE], or a
+        // consumer that stops at [DONE] loses them (the "response capped off" bug).
+        let mut f = SseThinkFilter::new();
+        let mut out = f
+            .push("data: {\"choices\":[{\"delta\":{\"content\":\"What can I do for you?\"}}]}\n\n");
+        out.push_str(
+            &f.push("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"),
+        );
+        out.push_str(&f.push("data: [DONE]\n\n"));
+        out.push_str(&f.finish());
+        assert_eq!(
+            visible_before_terminator(&out),
+            "What can I do for you?",
+            "tail stranded after [DONE]: {out}"
+        );
+    }
+
+    #[test]
+    fn anthropic_tail_is_flushed_before_message_stop_not_after() {
+        let mut f = SseThinkFilter::new();
+        let mut out = f.push(
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Is there something specific\"}}\n\n",
+        );
+        out.push_str(&f.push(
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        ));
+        out.push_str(&f.push("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+        out.push_str(&f.finish());
+        assert_eq!(
+            visible_before_terminator(&out),
+            "Is there something specific",
+            "tail stranded after message_stop: {out}"
+        );
+    }
+
+    #[test]
+    fn tail_after_terminator_is_not_double_emitted() {
+        // The tail is flushed once (before the terminator); `finish()` must not
+        // emit it a second time.
+        let mut f = SseThinkFilter::new();
+        let mut out = f.push("data: {\"choices\":[{\"delta\":{\"content\":\"abcdefghij\"}}]}\n\n");
+        out.push_str(&f.push("data: [DONE]\n\n"));
+        out.push_str(&f.finish());
+        assert_eq!(
+            out.matches("abcdefghij").count(),
+            0,
+            "no full copy expected"
+        );
+        // The held-back tail "defghij" appears exactly once, before [DONE].
+        assert_eq!(
+            out.matches("defghij").count(),
+            1,
+            "tail emitted once: {out}"
+        );
+        let done_at = out.find("[DONE]").expect("[DONE] present");
+        let tail_at = out.find("defghij").expect("tail present");
+        assert!(tail_at < done_at, "tail must precede [DONE]: {out}");
+        // And the full text is recoverable in order before the terminator.
+        assert_eq!(visible_before_terminator(&out), "abcdefghij");
     }
 
     #[test]
