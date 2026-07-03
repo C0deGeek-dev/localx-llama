@@ -6,7 +6,7 @@ Shared Rust crate tier for the LocalX stack — the primitives reused by
 | Crate | Responsibility |
 |---|---|
 | `localx-llama-core` | Pure domain: model definitions, `llama-server` argv builder, VRAM/quant-fit math, config precedence, tuner/AutoBest schema. No I/O. |
-| `localx-llama-runtime` | Process/network side behind cross-platform traits: server lifecycle, pin-verified install/download, CPU-only embed-serve, in-process no-think streaming filter. |
+| `localx-llama-runtime` | Process/network side behind cross-platform traits: server lifecycle, pin-verify + asset-selection *decision logic* (the HTTP fetch/install shell lives in the consuming app), CPU-only embed-serve, and the in-process no-think proxy (method/header-faithful forwarding + per-delta SSE `<think>` stripping). |
 | `localx-eval-core` | Evaluation primitives extracted from LocalPilot's harness: scorecard, blind judge, ablation, stack-detected grader. Shared by LocalPilot and LocalBench. |
 
 ## Consuming this repo

@@ -16,6 +16,11 @@ pub fn simplify_cwd(path: &Path) -> PathBuf {
 
 /// Spawn a detached child, optionally in a working directory and with stdout+
 /// stderr redirected to a log file.
+///
+/// "Detached" means the child is placed in its own process group so a Ctrl-C or
+/// console-close in the launching shell does not signal it: on Windows via
+/// `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`, on Unix via `process_group(0)`.
+/// Both APIs are safe (no `unsafe`), so the crate's `forbid(unsafe_code)` holds.
 pub fn spawn_detached(
     program: &str,
     args: &[String],
@@ -32,8 +37,27 @@ pub fn spawn_detached(
         let err = out.try_clone()?;
         cmd.stdout(Stdio::from(out)).stderr(Stdio::from(err));
     }
+    detach(&mut cmd);
     cmd.spawn()
 }
+
+#[cfg(windows)]
+fn detach(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    // CREATE_NEW_PROCESS_GROUP (0x0200) | DETACHED_PROCESS (0x0008): the child
+    // gets its own group and no inherited console.
+    cmd.creation_flags(0x0000_0200 | 0x0000_0008);
+}
+
+#[cfg(unix)]
+fn detach(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // A new process group so the parent shell's Ctrl-C/SIGINT does not reach it.
+    cmd.process_group(0);
+}
+
+#[cfg(not(any(windows, unix)))]
+fn detach(_cmd: &mut Command) {}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

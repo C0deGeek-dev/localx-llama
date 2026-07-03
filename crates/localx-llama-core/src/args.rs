@@ -416,12 +416,15 @@ pub fn build_llama_server_args(
         }
     }
 
-    // KV cache types (validated against mode).
+    // KV cache types (validated against mode). llama.cpp's --cache-type-k/v
+    // matcher is exact-match against lowercase type names, so emit the lowercased
+    // form we validated — otherwise an uppercase catalog spelling (e.g. "Q8_0")
+    // passes validation here and is then rejected by the server at startup.
     let (kv_k, kv_v) = resolve_kv_types(def, p.kv_k.as_deref(), p.kv_v.as_deref());
     validate_kv_type(&kv_k, mode)?;
     validate_kv_type(&kv_v, mode)?;
-    push2("--cache-type-k", kv_k, &mut a);
-    push2("--cache-type-v", kv_v, &mut a);
+    push2("--cache-type-k", kv_k.to_ascii_lowercase(), &mut a);
+    push2("--cache-type-v", kv_v.to_ascii_lowercase(), &mut a);
 
     // Chat template.
     let parser = def.parser.as_deref().unwrap_or("none");
@@ -581,6 +584,23 @@ mod tests {
         // per-model extra args before per-call.
         assert!(j.ends_with("--from-def --from-call"));
         // ub<=b NOT enforced: both emitted verbatim even if equal.
+    }
+
+    #[test]
+    fn kv_type_is_emitted_lowercase_even_from_an_uppercase_catalog_spelling() {
+        // llama.cpp matches --cache-type-k exact-lowercase; an uppercase catalog
+        // value must not pass validation and then get rejected by the server.
+        let d = base_def();
+        let p = LaunchParams {
+            kv_k: Some("Q8_0".into()),
+            kv_v: Some("Q8_0".into()),
+            ..Default::default()
+        };
+        let args = build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &p).unwrap();
+        let j = args.join(" ");
+        assert!(j.contains("--cache-type-k q8_0"), "got: {j}");
+        assert!(j.contains("--cache-type-v q8_0"), "got: {j}");
+        assert!(!j.contains("Q8_0"), "uppercase leaked to argv: {j}");
     }
 
     #[test]

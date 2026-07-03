@@ -11,10 +11,6 @@ pub enum RuntimeError {
     #[error("download pin required but none is configured; computed SHA-256 is {computed}")]
     PinRequired { computed: String },
 
-    /// No release asset matched the required platform.
-    #[error("no matching release asset for this platform")]
-    NoMatchingAsset,
-
     /// A `llama-server` binary could not be located and none was provided.
     #[error("no llama-server binary available; provide one on PATH or in config (bring-your-own)")]
     NoServerBinary,

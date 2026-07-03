@@ -17,6 +17,14 @@ use serde_json::{Map, Value};
 /// Substituted for an assistant turn that strips to nothing.
 pub const EMPTY_AFTER_THINK: &str = "[no output]";
 
+/// First index of `needle` in `haystack` (small-needle scan for SSE delimiters).
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 const OPEN: &str = "<think>";
 const CLOSE: &str = "</think>";
 /// Longest tag is `</think>` (8); hold back 7 trailing chars so a tag split
@@ -139,6 +147,168 @@ impl ThinkStripper {
             idx += 1;
         }
         idx
+    }
+}
+
+/// Strip `<think>` spans from a **non-streaming** JSON response body, in place
+/// on the assistant text fields, and substitute `[no output]` when a turn strips
+/// to nothing. Handles both the Anthropic (`content[].text`) and OpenAI
+/// (`choices[].message.content`) response shapes. A body that is not one of those
+/// shapes falls back to a whole-string strip (harmless for a model list / props).
+pub fn strip_think_json_response(body: &[u8]) -> Vec<u8> {
+    let Ok(mut v) = serde_json::from_slice::<Value>(body) else {
+        // Not JSON — strip the raw text (covers a plain-text completion).
+        return strip_think(&String::from_utf8_lossy(body)).into_bytes();
+    };
+    let mut touched = false;
+    // Anthropic: { "content": [ { "type":"text", "text":"..." }, ... ] }
+    if let Some(Value::Array(blocks)) = v.get_mut("content") {
+        for b in blocks.iter_mut() {
+            if b.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(Value::String(t)) = b.get_mut("text") {
+                    *t = fallback_if_empty(&strip_think(t));
+                    touched = true;
+                }
+            }
+        }
+    }
+    // OpenAI: { "choices": [ { "message": { "content":"..." } }, ... ] }
+    if let Some(Value::Array(choices)) = v.get_mut("choices") {
+        for c in choices.iter_mut() {
+            if let Some(Value::String(t)) = c.pointer_mut("/message/content") {
+                *t = fallback_if_empty(&strip_think(t));
+                touched = true;
+            }
+        }
+    }
+    if !touched {
+        return body.to_vec();
+    }
+    serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec())
+}
+
+/// Stateful `<think>` filter for a **streaming** SSE response. Feeds raw response
+/// bytes (arbitrary chunk boundaries), splits complete SSE events, and rewrites
+/// the assistant text *inside* each event's `data:` JSON delta through a shared
+/// [`ThinkStripper`] — so a `<think>` span crossing two `data:` events is stripped
+/// without ever corrupting the SSE framing between them. Non-delta events, `:`
+/// comments, and `data: [DONE]` pass through untouched.
+#[derive(Debug, Default)]
+pub struct SseThinkFilter {
+    /// Bytes not yet forming a complete event (`\n\n`-terminated). Kept as bytes
+    /// so a chunk boundary splitting a multibyte UTF-8 char is never lossily
+    /// decoded — complete events end at an ASCII `\n\n`, so each is valid UTF-8.
+    pending: Vec<u8>,
+    stripper: ThinkStripper,
+    shape: Option<DeltaShape>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DeltaShape {
+    /// OpenAI: `choices[0].delta.content`.
+    OpenAi,
+    /// Anthropic: `delta.text` (type `text_delta`).
+    Anthropic,
+}
+
+impl SseThinkFilter {
+    /// A fresh filter.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed the next raw chunk; returns transformed bytes safe to forward now.
+    pub fn push(&mut self, chunk: impl AsRef<[u8]>) -> String {
+        self.pending.extend_from_slice(chunk.as_ref());
+        let mut out = String::new();
+        // An SSE event ends at a blank line ("\n\n"). Process every complete one.
+        while let Some(idx) = find_subslice(&self.pending, b"\n\n") {
+            let event = String::from_utf8_lossy(&self.pending[..idx + 2]).into_owned();
+            self.pending.drain(..idx + 2);
+            out.push_str(&self.transform_event(&event));
+        }
+        out
+    }
+
+    /// Flush at end of stream: emit any held-back tail as a final delta in the
+    /// detected shape, plus any trailing partial event verbatim.
+    pub fn finish(&mut self) -> String {
+        let mut out = String::new();
+        let tail = self.stripper.finish();
+        if !tail.is_empty() {
+            if let Some(frame) = self.shape.map(|s| s.data_frame(&tail)) {
+                out.push_str(&frame);
+            }
+        }
+        if !self.pending.is_empty() {
+            out.push_str(&String::from_utf8_lossy(&self.pending));
+            self.pending.clear();
+        }
+        out
+    }
+
+    fn transform_event(&mut self, event: &str) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        for line in event.split_inclusive('\n') {
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if let Some(payload) = trimmed.strip_prefix("data:") {
+                let payload = payload.trim_start();
+                if payload == "[DONE]" || payload.is_empty() {
+                    lines.push(line.to_string());
+                    continue;
+                }
+                if let Some(rewritten) = self.rewrite_data(payload) {
+                    lines.push(format!("data: {rewritten}\n"));
+                } else {
+                    lines.push(line.to_string());
+                }
+            } else {
+                lines.push(line.to_string());
+            }
+        }
+        lines.concat()
+    }
+
+    /// Rewrite one `data:` JSON payload's delta text through the stripper.
+    /// Returns `None` when the payload isn't a recognized text delta (pass through).
+    fn rewrite_data(&mut self, payload: &str) -> Option<String> {
+        let mut v: Value = serde_json::from_str(payload).ok()?;
+        // OpenAI streaming: choices[].delta.content
+        if let Some(Value::String(t)) = v.pointer_mut("/choices/0/delta/content") {
+            self.shape = Some(DeltaShape::OpenAi);
+            let stripped = self.stripper.push(t);
+            *t = stripped;
+            return serde_json::to_string(&v).ok();
+        }
+        // Anthropic streaming: delta.text (content_block_delta / text_delta)
+        if v.get("delta")
+            .and_then(|d| d.get("type"))
+            .and_then(Value::as_str)
+            == Some("text_delta")
+        {
+            if let Some(Value::String(t)) = v.pointer_mut("/delta/text") {
+                self.shape = Some(DeltaShape::Anthropic);
+                let stripped = self.stripper.push(t);
+                *t = stripped;
+                return serde_json::to_string(&v).ok();
+            }
+        }
+        None
+    }
+}
+
+impl DeltaShape {
+    /// A minimal terminal `data:` frame carrying `text`, in this shape.
+    fn data_frame(self, text: &str) -> String {
+        let v = match self {
+            DeltaShape::OpenAi => {
+                serde_json::json!({ "choices": [ { "delta": { "content": text } } ] })
+            }
+            DeltaShape::Anthropic => {
+                serde_json::json!({ "type": "content_block_delta", "delta": { "type": "text_delta", "text": text } })
+            }
+        };
+        format!("data: {v}\n\n")
     }
 }
 
@@ -306,5 +476,113 @@ mod tests {
         let before = body.clone();
         merge_system_messages(&mut body);
         assert_eq!(body, before);
+    }
+
+    #[test]
+    fn json_response_strip_anthropic_shape() {
+        let body =
+            br#"{"content":[{"type":"text","text":"a<think>x</think>b"}],"role":"assistant"}"#;
+        let out = strip_think_json_response(body);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["content"][0]["text"], json!("ab"));
+    }
+
+    #[test]
+    fn json_response_strip_openai_shape() {
+        let body = br#"{"choices":[{"message":{"content":"<think>all</think>hi"}}]}"#;
+        let out = strip_think_json_response(body);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["choices"][0]["message"]["content"], json!("hi"));
+    }
+
+    #[test]
+    fn json_response_all_think_becomes_no_output() {
+        let body = br#"{"content":[{"type":"text","text":"<think>only</think>"}]}"#;
+        let out = strip_think_json_response(body);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["content"][0]["text"], json!("[no output]"));
+    }
+
+    #[test]
+    fn json_response_passes_through_a_model_list() {
+        // Not a chat shape (no content/choices text) — must be byte-identical.
+        let body = br#"{"models":[{"id":"m1"},{"id":"m2"}]}"#;
+        assert_eq!(strip_think_json_response(body), body.to_vec());
+    }
+
+    #[test]
+    fn sse_strips_think_within_one_openai_delta() {
+        let mut f = SseThinkFilter::new();
+        let mut out =
+            f.push("data: {\"choices\":[{\"delta\":{\"content\":\"a<think>x</think>b\"}}]}\n\n");
+        out.push_str(&f.finish());
+        // Think content gone; visible "a" and "b" both survive (the trailing "b"
+        // is held back for split-tag safety and flushed at finish as its own frame).
+        assert!(
+            !out.contains("<think>") && !out.contains('x'),
+            "leaked: {out}"
+        );
+        let visible: String = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|p| serde_json::from_str::<Value>(p).ok())
+            .filter_map(|v| {
+                v.pointer("/choices/0/delta/content")
+                    .and_then(|c| c.as_str().map(String::from))
+            })
+            .collect();
+        assert_eq!(visible, "ab", "got: {out}");
+        assert!(out.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn sse_strips_think_span_crossing_two_events_without_corrupting_framing() {
+        // The <think> opens in event 1's delta and closes in event 3's delta.
+        let mut f = SseThinkFilter::new();
+        let mut out = String::new();
+        out.push_str(
+            &f.push("data: {\"choices\":[{\"delta\":{\"content\":\"keep <think>\"}}]}\n\n"),
+        );
+        out.push_str(&f.push("data: {\"choices\":[{\"delta\":{\"content\":\"secret \"}}]}\n\n"));
+        out.push_str(
+            &f.push("data: {\"choices\":[{\"delta\":{\"content\":\"more</think> done\"}}]}\n\n"),
+        );
+        out.push_str(&f.push("data: [DONE]\n\n"));
+        out.push_str(&f.finish());
+        // No think content leaks; SSE framing (one event per data line) intact.
+        assert!(!out.contains("secret"), "leaked think: {out}");
+        assert!(
+            !out.contains("<think>") && !out.contains("</think>"),
+            "leaked tag: {out}"
+        );
+        assert!(out.contains("[DONE]"));
+        // Every data line is still a standalone \n\n-terminated event.
+        assert_eq!(out.matches("data: ").count(), out.matches("\n\n").count());
+        // The visible words survive.
+        let visible: String = out.matches(|_c| true).collect();
+        assert!(
+            visible.contains("keep") && visible.contains("done"),
+            "lost text: {out}"
+        );
+    }
+
+    #[test]
+    fn sse_passes_through_done_and_non_delta_events() {
+        let mut f = SseThinkFilter::new();
+        let out = f.push("event: message_start\ndata: {\"type\":\"message_start\"}\n\n")
+            + &f.push("data: [DONE]\n\n")
+            + &f.finish();
+        assert!(out.contains("message_start"));
+        assert!(out.contains("[DONE]"));
+    }
+
+    #[test]
+    fn sse_strips_anthropic_text_delta() {
+        let mut f = SseThinkFilter::new();
+        let out = f.push(
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"<think>h</think>hi\"}}\n\n",
+        ) + &f.finish();
+        assert!(out.contains(r#""text":"hi""#), "got: {out}");
+        assert!(out.contains("content_block_delta"));
     }
 }

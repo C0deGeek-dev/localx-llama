@@ -23,8 +23,8 @@ pub mod vram;
 
 pub use error::CoreError;
 pub use launcher::{
-    assert_compatible, discover_root, BackendSession, KvTypes, Launcher, LauncherError,
-    LauncherVersion, RUNTIME_LLAMACPP, TARGET_LOCALBOX,
+    assert_compatible, BackendSession, KvTypes, Launcher, LauncherError, LauncherVersion,
+    RUNTIME_LLAMACPP, TARGET_LOCALBOX,
 };
 pub use model::{Mode, ModelDef, QuantEntry};
 pub use tuner::{Overrides, TunerBestConfig, TunerEntry, TUNER_SCHEMA};

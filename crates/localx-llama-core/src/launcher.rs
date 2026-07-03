@@ -87,24 +87,6 @@ pub fn assert_compatible(
     Ok(())
 }
 
-/// Resolve a sibling product's root directory, in the pinned precedence order:
-/// an explicit environment override wins, then the persisted setting, then the
-/// conventional sibling-checkout location. First non-blank wins; `None` when
-/// nothing is configured.
-#[must_use]
-pub fn discover_root(
-    env_override: Option<&str>,
-    setting: Option<&str>,
-    sibling: Option<&str>,
-) -> Option<PathBuf> {
-    [env_override, setting, sibling]
-        .into_iter()
-        .flatten()
-        .map(str::trim)
-        .find(|candidate| !candidate.is_empty())
-        .map(PathBuf::from)
-}
-
 /// The baseline KV cache types a launcher reports for a model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KvTypes {
@@ -248,25 +230,6 @@ mod tests {
         assert!(err.to_string().contains("vllm"));
         // Blank target/runtime means "no preference" and always passes.
         assert!(assert_compatible(&version(), "", "").is_ok());
-    }
-
-    #[test]
-    fn root_discovery_honours_the_precedence_order() {
-        // Env override wins over everything.
-        assert_eq!(
-            discover_root(Some("C:/env"), Some("C:/setting"), Some("C:/sibling")),
-            Some(PathBuf::from("C:/env"))
-        );
-        // A blank env falls through to the setting, then the sibling.
-        assert_eq!(
-            discover_root(Some("  "), Some("C:/setting"), Some("C:/sibling")),
-            Some(PathBuf::from("C:/setting"))
-        );
-        assert_eq!(
-            discover_root(None, None, Some("C:/sibling")),
-            Some(PathBuf::from("C:/sibling"))
-        );
-        assert_eq!(discover_root(None, None, None), None);
     }
 
     #[test]

@@ -5,11 +5,15 @@
 //! is unit-testable with a mock (no live server needed); [`ReqwestUpstream`] is
 //! the production impl.
 //!
-//! This first cut buffers and strips non-streaming responses. True SSE streaming
-//! (per-chunk [`crate::nothink::ThinkStripper`]) and the per-turn `[no output]`
-//! fallback within a parsed response are follow-ups; the streaming stripper and
-//! the fallback are already unit-tested in `nothink`.
+//! The proxy is a faithful HTTP forwarder: it preserves method, path, query, and
+//! headers in both directions, so `GET` endpoints (`/props`, `/v1/models`,
+//! `/tokenize`) work through it as well as the `POST` chat path. `<think>`
+//! stripping is content-type aware: streaming (`text/event-stream`) responses are
+//! rewritten per SSE delta by [`crate::nothink::SseThinkFilter`] (framing-safe),
+//! non-streaming chat JSON by [`crate::nothink::strip_think_json_response`], and
+//! everything else (model lists, `/props`) passes through untouched.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::{
@@ -20,9 +24,40 @@ use axum::{
     routing::get,
     Router,
 };
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
+use http::{HeaderMap, Method};
 use serde_json::{json, Value};
 
-use crate::nothink::{strip_think, transform_request};
+use crate::nothink::{strip_think_json_response, transform_request, SseThinkFilter};
+
+/// A streamed response body: chunks of bytes from the upstream, errors surfaced.
+pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, ProxyError>> + Send>>;
+
+/// Hop-by-hop headers (RFC 7230 §6.1) plus length/host headers that must not be
+/// copied verbatim across the proxy — the body may be re-encoded and reqwest sets
+/// host/length itself.
+const SKIP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+    "host",
+];
+
+fn copy_headers(src: &HeaderMap, dst: &mut HeaderMap) {
+    for (name, value) in src {
+        if SKIP_HEADERS.contains(&name.as_str()) {
+            continue;
+        }
+        dst.append(name.clone(), value.clone());
+    }
+}
 
 /// Max request body accepted before returning 413 (mirrors the proxy ceiling).
 pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -38,22 +73,34 @@ pub enum ProxyError {
     Listen(String),
 }
 
-/// A buffered upstream response.
-#[derive(Debug, Clone)]
+/// A request to forward upstream, preserving method/path+query/headers.
+pub struct ForwardRequest {
+    /// HTTP method (GET, POST, …).
+    pub method: Method,
+    /// Path and query string, e.g. `/v1/models` or `/props?verbose=1`.
+    pub path_and_query: String,
+    /// Request headers (hop-by-hop/length/host are dropped by the forwarder).
+    pub headers: HeaderMap,
+    /// Request body (already request-transformed for chat bodies).
+    pub body: Vec<u8>,
+}
+
+/// An upstream response with status, headers, and a streamed body.
 pub struct ForwardResponse {
     /// HTTP status code from the upstream.
     pub status: u16,
-    /// Response body bytes.
-    pub body: Vec<u8>,
+    /// Response headers from the upstream.
+    pub headers: HeaderMap,
+    /// Streamed response body.
+    pub body: ByteStream,
 }
 
 /// The upstream the proxy forwards to. Abstracted for testability.
 pub trait Upstream: Send + Sync + 'static {
-    /// Forward a request body to `path` and return the buffered response.
+    /// Forward a request upstream and return the streamed response.
     fn forward(
         &self,
-        path: String,
-        body: Vec<u8>,
+        req: ForwardRequest,
     ) -> impl std::future::Future<Output = Result<ForwardResponse, ProxyError>> + Send;
 }
 
@@ -117,31 +164,125 @@ async fn proxy_handler<U: Upstream>(
             return status_body(StatusCode::UNAUTHORIZED, "missing or wrong api key");
         }
     }
-    let path = req.uri().path().to_string();
+    let method = req.method().clone();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let headers = req.headers().clone();
 
     let bytes = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(_) => return status_body(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
 
-    // Request-side transforms: strip thinking keys at the root, merge system msgs.
-    let out_body = match serde_json::from_slice::<Value>(&bytes) {
+    // Request-side transforms apply only to a chat body (a JSON object with
+    // `messages`); GET probes and other endpoints forward their body unchanged.
+    let (out_body, is_chat) = match serde_json::from_slice::<Value>(&bytes) {
         Ok(mut v) => {
-            transform_request(&mut v, state.config.merge_system);
-            serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec())
+            let chat = v.get("messages").is_some();
+            if chat {
+                transform_request(&mut v, state.config.merge_system);
+                (
+                    serde_json::to_vec(&v).unwrap_or_else(|_| bytes.to_vec()),
+                    true,
+                )
+            } else {
+                (bytes.to_vec(), false)
+            }
         }
-        Err(_) => bytes.to_vec(),
+        Err(_) => (bytes.to_vec(), false),
     };
 
-    match state.upstream.forward(path, out_body).await {
-        Ok(resp) => {
-            let stripped = strip_think(&String::from_utf8_lossy(&resp.body));
-            let mut r = Response::new(Body::from(stripped));
-            *r.status_mut() = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
-            r
-        }
+    let fwd = ForwardRequest {
+        method,
+        path_and_query,
+        headers,
+        body: out_body,
+    };
+    match state.upstream.forward(fwd).await {
+        Ok(resp) => build_response(resp, is_chat).await,
         Err(e) => status_body(StatusCode::BAD_GATEWAY, &e.to_string()),
     }
+}
+
+/// Is this an SSE (streaming) response?
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"))
+}
+
+/// Build the client-facing response from the upstream one: copy status + safe
+/// headers, then strip `<think>` per content type (SSE per-delta; non-streaming
+/// chat JSON in place; everything else untouched).
+async fn build_response(resp: ForwardResponse, is_chat: bool) -> Response {
+    let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let sse = is_event_stream(&resp.headers);
+
+    let mut builder = Response::builder().status(status);
+    if let Some(hs) = builder.headers_mut() {
+        copy_headers(&resp.headers, hs);
+    }
+
+    if sse {
+        // Stream the upstream through the framing-safe SSE think filter.
+        let body = Body::from_stream(sse_think_stream(resp.body));
+        return builder.body(body).unwrap_or_else(|_| {
+            status_body(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+        });
+    }
+
+    // Non-streaming: buffer, then strip only a chat JSON body (pass /models,
+    // /props, and other non-chat bodies through unchanged).
+    let buffered = match collect_stream(resp.body).await {
+        Ok(b) => b,
+        Err(e) => return status_body(StatusCode::BAD_GATEWAY, &e.to_string()),
+    };
+    let out = if is_chat {
+        strip_think_json_response(&buffered)
+    } else {
+        buffered
+    };
+    builder
+        .body(Body::from(out))
+        .unwrap_or_else(|_| status_body(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+}
+
+/// Drain a byte stream into a buffer (non-streaming responses are small — model
+/// lists, `/props`, a single completion object).
+async fn collect_stream(mut body: ByteStream) -> Result<Vec<u8>, ProxyError> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = body.next().await {
+        buf.extend_from_slice(&chunk?);
+    }
+    Ok(buf)
+}
+
+/// Wrap an upstream SSE byte stream, rewriting each event's delta text through a
+/// single [`SseThinkFilter`] and flushing its held-back tail at end of stream.
+fn sse_think_stream(inner: ByteStream) -> impl Stream<Item = Result<Bytes, ProxyError>> + Send {
+    futures::stream::unfold(
+        (inner, SseThinkFilter::new(), false),
+        |(mut inner, mut filter, finished)| async move {
+            if finished {
+                return None;
+            }
+            match inner.next().await {
+                Some(Ok(chunk)) => {
+                    let out = filter.push(&chunk);
+                    Some((Ok(Bytes::from(out)), (inner, filter, false)))
+                }
+                Some(Err(e)) => Some((Err(e), (inner, filter, true))),
+                None => {
+                    let tail = filter.finish();
+                    Some((Ok(Bytes::from(tail)), (inner, filter, true)))
+                }
+            }
+        },
+    )
 }
 
 fn status_body(status: StatusCode, msg: &str) -> Response {
@@ -200,26 +341,38 @@ impl ReqwestUpstream {
 }
 
 impl Upstream for ReqwestUpstream {
-    async fn forward(&self, path: String, body: Vec<u8>) -> Result<ForwardResponse, ProxyError> {
-        let url = format!("{}{}", self.base_url, path);
+    async fn forward(&self, req: ForwardRequest) -> Result<ForwardResponse, ProxyError> {
+        let url = format!("{}{}", self.base_url, req.path_and_query);
+        // Copy the method and headers (minus hop-by-hop/length/host) so GET
+        // probes, query strings, and content negotiation reach the upstream.
+        let mut fwd_headers = HeaderMap::new();
+        copy_headers(&req.headers, &mut fwd_headers);
         let resp = self
             .client
-            .post(url)
-            .header("content-type", "application/json")
-            .body(body)
+            .request(req.method, &url)
+            .headers(fwd_headers)
+            .body(req.body)
             .send()
             .await
             .map_err(|e| ProxyError::Upstream(e.to_string()))?;
         let status = resp.status().as_u16();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| ProxyError::Upstream(e.to_string()))?;
+        let headers = resp.headers().clone();
+        let body: ByteStream = Box::pin(
+            resp.bytes_stream()
+                .map(|r| r.map_err(|e| ProxyError::Upstream(e.to_string()))),
+        );
         Ok(ForwardResponse {
             status,
-            body: bytes.to_vec(),
+            headers,
+            body,
         })
     }
+}
+
+/// Build a single-chunk [`ByteStream`] from a buffer (test helper).
+#[cfg(test)]
+fn once_stream(bytes: Vec<u8>) -> ByteStream {
+    Box::pin(futures::stream::once(async move { Ok(Bytes::from(bytes)) }))
 }
 
 #[cfg(test)]
@@ -230,50 +383,76 @@ mod tests {
     use std::sync::Mutex;
     use tower::ServiceExt;
 
+    /// A mock upstream that records the forwarded request and returns a
+    /// configurable response (status, content-type, body).
     struct MockUpstream {
         last_body: Mutex<Vec<u8>>,
+        last_method: Mutex<String>,
+        last_path: Mutex<String>,
+        last_headers: Mutex<HeaderMap>,
+        resp_status: u16,
+        resp_content_type: Option<String>,
+        resp_body: Vec<u8>,
+    }
+
+    impl MockUpstream {
+        fn new() -> Self {
+            Self {
+                last_body: Mutex::new(Vec::new()),
+                last_method: Mutex::new(String::new()),
+                last_path: Mutex::new(String::new()),
+                last_headers: Mutex::new(HeaderMap::new()),
+                resp_status: 200,
+                resp_content_type: None,
+                resp_body: b"answer<think>hidden</think> done".to_vec(),
+            }
+        }
+        fn responding(status: u16, content_type: Option<&str>, body: &[u8]) -> Self {
+            Self {
+                resp_status: status,
+                resp_content_type: content_type.map(str::to_string),
+                resp_body: body.to_vec(),
+                ..Self::new()
+            }
+        }
     }
 
     impl Upstream for MockUpstream {
-        async fn forward(
-            &self,
-            _path: String,
-            body: Vec<u8>,
-        ) -> Result<ForwardResponse, ProxyError> {
-            *self.last_body.lock().unwrap() = body;
+        async fn forward(&self, req: ForwardRequest) -> Result<ForwardResponse, ProxyError> {
+            *self.last_body.lock().unwrap() = req.body;
+            *self.last_method.lock().unwrap() = req.method.to_string();
+            *self.last_path.lock().unwrap() = req.path_and_query;
+            *self.last_headers.lock().unwrap() = req.headers;
+            let mut headers = HeaderMap::new();
+            if let Some(ct) = &self.resp_content_type {
+                headers.insert(http::header::CONTENT_TYPE, ct.parse().unwrap());
+            }
             Ok(ForwardResponse {
-                status: 200,
-                body: b"answer<think>hidden</think> done".to_vec(),
+                status: self.resp_status,
+                headers,
+                body: once_stream(self.resp_body.clone()),
             })
         }
     }
 
-    fn state() -> Arc<ProxyState<MockUpstream>> {
+    fn state_with(mock: MockUpstream, api_key: Option<&str>) -> Arc<ProxyState<MockUpstream>> {
         Arc::new(ProxyState {
-            upstream: MockUpstream {
-                last_body: Mutex::new(Vec::new()),
-            },
+            upstream: mock,
             config: ProxyConfig {
                 target_host: "127.0.0.1".into(),
                 target_port: 8080,
                 merge_system: true,
-                api_key: None,
+                api_key: api_key.map(str::to_string),
             },
         })
     }
 
+    fn state() -> Arc<ProxyState<MockUpstream>> {
+        state_with(MockUpstream::new(), None)
+    }
+
     fn keyed_state(key: &str) -> Arc<ProxyState<MockUpstream>> {
-        Arc::new(ProxyState {
-            upstream: MockUpstream {
-                last_body: Mutex::new(Vec::new()),
-            },
-            config: ProxyConfig {
-                target_host: "127.0.0.1".into(),
-                target_port: 8080,
-                merge_system: true,
-                api_key: Some(key.to_string()),
-            },
-        })
+        state_with(MockUpstream::new(), Some(key))
     }
 
     #[tokio::test]
@@ -299,6 +478,96 @@ mod tests {
         let sent = String::from_utf8(st.upstream.last_body.lock().unwrap().clone()).unwrap();
         assert!(!sent.contains("thinking")); // root thinking key removed
         assert!(sent.contains("\"system\":\"sys\"")); // system message merged up
+    }
+
+    #[tokio::test]
+    async fn get_probe_preserves_method_query_and_passes_body_through() {
+        // A GET /props?verbose=1 must reach upstream as GET with the query, and
+        // its (non-chat) response body must pass through untouched.
+        let st = state_with(
+            MockUpstream::responding(
+                200,
+                Some("application/json"),
+                br#"{"modalities":{"vision":true}}"#,
+            ),
+            None,
+        );
+        let app = router(st.clone());
+        let req = Request::builder()
+            .method("GET")
+            .uri("/props?verbose=1")
+            .header("x-custom", "abc")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"modalities":{"vision":true}}"#); // untouched
+        assert_eq!(*st.upstream.last_method.lock().unwrap(), "GET");
+        assert_eq!(*st.upstream.last_path.lock().unwrap(), "/props?verbose=1");
+        // Client headers reach upstream; hop-by-hop/host are dropped.
+        let sent = st.upstream.last_headers.lock().unwrap().clone();
+        assert_eq!(sent.get("x-custom").unwrap(), "abc");
+        assert!(sent.get("host").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_models_list_is_not_think_stripped() {
+        // A model list is not a chat body — even if it somehow contained the
+        // token, we must not rewrite a non-chat JSON response.
+        let st = state_with(
+            MockUpstream::responding(200, Some("application/json"), br#"{"data":[{"id":"m"}]}"#),
+            None,
+        );
+        let app = router(st);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"data":[{"id":"m"}]}"#);
+    }
+
+    #[tokio::test]
+    async fn streaming_sse_response_is_stripped_per_delta_without_corrupting_framing() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"keep <think>\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\"secret</think> done\"}}]}\n\n\
+                   data: [DONE]\n\n";
+        let st = state_with(
+            MockUpstream::responding(200, Some("text/event-stream"), sse.as_bytes()),
+            None,
+        );
+        let app = router(st);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(Body::from(
+                r#"{"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(http::header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("secret"), "leaked think content: {text}");
+        assert!(
+            !text.contains("<think>") && !text.contains("</think>"),
+            "leaked tag: {text}"
+        );
+        assert!(text.contains("[DONE]"));
+        assert_eq!(text.matches("data: ").count(), text.matches("\n\n").count());
     }
 
     #[tokio::test]
