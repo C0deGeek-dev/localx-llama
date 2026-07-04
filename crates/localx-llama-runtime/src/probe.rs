@@ -51,6 +51,13 @@ fn run_nvidia_smi(query: &str) -> Option<String> {
 
 /// The real system hardware probe. Session callers may cache the VRAM result so
 /// repeated dashboard renders don't re-invoke nvidia-smi.
+///
+/// Library-only / not yet wired: this is the shared nvidia-smi [`HardwareProbe`]
+/// impl offered to consumers, but LocalBox currently carries its own richer probe
+/// (it also handles Apple-Silicon unified memory) and feeds that into the shared
+/// [`localx_llama_core::vram::resolve_vram`] ladder. Kept as the canonical shared
+/// probe; wire a consumer to it (and drop their bespoke one) or remove it if a
+/// second probe stays justified.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemProbe;
 

@@ -263,6 +263,18 @@ async fn collect_stream(mut body: ByteStream) -> Result<Vec<u8>, ProxyError> {
 
 /// Wrap an upstream SSE byte stream, rewriting each event's delta text through a
 /// single [`SseThinkFilter`] and flushing its held-back tail at end of stream.
+///
+/// **Cross-repo contract (StreamTruncated).** A mid-stream upstream error is
+/// surfaced as a terminal `Err` *after* the held-back tail is flushed. Into
+/// [`Body::from_stream`] that `Err` aborts the client response body, so a
+/// consumer sees a truncated (retryable) stream — never a clean EOF. Consumers
+/// (e.g. LocalPilot's `ProviderError::StreamTruncated` retry) depend on this: a
+/// mid-stream drop MUST NOT be turned into a graceful end. This is pinned by
+/// `build_response_aborts_the_client_body_on_a_mid_stream_error` at the HTTP
+/// boundary, not only by the combinator test. Note the flushed tail from
+/// [`SseThinkFilter::finish`] may be an incomplete trailing SSE frame when the
+/// drop lands mid-event — harmless because the stream is already being torn down
+/// as truncated.
 fn sse_think_stream(inner: ByteStream) -> impl Stream<Item = Result<Bytes, ProxyError>> + Send {
     // Drives the fold: normal streaming, a one-shot error emission (after the
     // held-back tail has been flushed), or terminated.
@@ -635,6 +647,42 @@ mod tests {
         assert_eq!(
             visible, "Hello world",
             "held-back tail lost on abort: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_response_aborts_the_client_body_on_a_mid_stream_error() {
+        // The cross-repo StreamTruncated contract, asserted at the HTTP body
+        // boundary (not just the combinator): when the upstream drops mid-stream,
+        // the client-facing response body must ABORT — surface an error frame —
+        // never end cleanly. That abort is exactly what makes a consumer (e.g.
+        // LocalPilot's `ProviderError::StreamTruncated` retry) treat the reply as
+        // truncated-and-retryable instead of accepting a silently cut-off answer.
+        // A refactor of `sse_think_stream` to a "graceful end" would keep the
+        // combinator test green while breaking this — so this drives `build_response`.
+        let delta = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n";
+        let body: ByteStream = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from(delta)),
+            Err(ProxyError::Upstream("connection reset".to_string())),
+        ]));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        let fwd = ForwardResponse {
+            status: 200,
+            headers,
+            body,
+        };
+        let resp = build_response(fwd, true).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Collecting the client body MUST fail: a clean EOF here would mean the
+        // consumer sees a complete (but truncated) reply and never retries.
+        let collected = axum::body::to_bytes(resp.into_body(), MAX_BODY_BYTES).await;
+        assert!(
+            collected.is_err(),
+            "a mid-stream upstream error must abort the client body, not end it cleanly"
         );
     }
 

@@ -109,6 +109,10 @@ pub fn quant_fit_class(size_gb: Option<f64>, vram_gb: i64) -> FitClass {
 /// The largest `num_ctx` safe to combine with a q8_0 KV cache.
 ///
 /// Each GB above ~16 is worth ~16k q8 tokens; floors at 64k.
+///
+/// Library-only / not yet wired: no consumer computes KV-cache pressure yet
+/// (LocalBox's fit hint is weight-only). Kept for a future KV-aware fit; wire a
+/// consumer or remove it if that never lands.
 pub fn q8_kv_max_context(vram_gb: i64) -> i64 {
     const FLOOR: i64 = 65_536;
     const PER_GB: i64 = 16_384;
