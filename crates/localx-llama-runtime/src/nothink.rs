@@ -12,7 +12,7 @@
 //! 4. Merge mid-conversation system messages into the top-level `system` field,
 //!    because Qwen chat templates hard-reject a system message after the start.
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 /// Substituted for an assistant turn that strips to nothing.
 pub const EMPTY_AFTER_THINK: &str = "[no output]";
@@ -424,11 +424,6 @@ pub fn transform_request(body: &mut Value, merge_system: bool) {
     if merge_system {
         merge_system_messages(body);
     }
-}
-
-/// Convenience: an empty request map (used by callers building bodies).
-pub fn empty_body() -> Value {
-    Value::Object(Map::new())
 }
 
 #[cfg(test)]
