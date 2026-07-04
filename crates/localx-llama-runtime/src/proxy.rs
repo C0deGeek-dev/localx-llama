@@ -264,22 +264,45 @@ async fn collect_stream(mut body: ByteStream) -> Result<Vec<u8>, ProxyError> {
 /// Wrap an upstream SSE byte stream, rewriting each event's delta text through a
 /// single [`SseThinkFilter`] and flushing its held-back tail at end of stream.
 fn sse_think_stream(inner: ByteStream) -> impl Stream<Item = Result<Bytes, ProxyError>> + Send {
+    // Drives the fold: normal streaming, a one-shot error emission (after the
+    // held-back tail has been flushed), or terminated.
+    enum Phase {
+        Streaming,
+        Erroring(ProxyError),
+        Done,
+    }
     futures::stream::unfold(
-        (inner, SseThinkFilter::new(), false),
-        |(mut inner, mut filter, finished)| async move {
-            if finished {
-                return None;
-            }
-            match inner.next().await {
-                Some(Ok(chunk)) => {
-                    let out = filter.push(&chunk);
-                    Some((Ok(Bytes::from(out)), (inner, filter, false)))
-                }
-                Some(Err(e)) => Some((Err(e), (inner, filter, true))),
-                None => {
-                    let tail = filter.finish();
-                    Some((Ok(Bytes::from(tail)), (inner, filter, true)))
-                }
+        (inner, SseThinkFilter::new(), Phase::Streaming),
+        |(mut inner, mut filter, phase)| async move {
+            match phase {
+                Phase::Done => None,
+                // The upstream error, emitted on its own poll so the flushed tail
+                // (yielded on the previous poll) reaches the client first.
+                Phase::Erroring(e) => Some((Err(e), (inner, filter, Phase::Done))),
+                Phase::Streaming => match inner.next().await {
+                    Some(Ok(chunk)) => {
+                        let out = filter.push(&chunk);
+                        Some((Ok(Bytes::from(out)), (inner, filter, Phase::Streaming)))
+                    }
+                    // Upstream dropped mid-stream. Flush the stripper's held-back
+                    // tail (up to `HOLDBACK` visible chars withheld for split-tag
+                    // safety) *before* surfacing the error — otherwise an abort
+                    // silently truncates the last characters of text already
+                    // generated, on top of losing the rest. The clean-EOF (`None`)
+                    // and terminator paths already flush; this is the error path.
+                    Some(Err(e)) => {
+                        let tail = filter.finish();
+                        if tail.is_empty() {
+                            Some((Err(e), (inner, filter, Phase::Done)))
+                        } else {
+                            Some((Ok(Bytes::from(tail)), (inner, filter, Phase::Erroring(e))))
+                        }
+                    }
+                    None => {
+                        let tail = filter.finish();
+                        Some((Ok(Bytes::from(tail)), (inner, filter, Phase::Done)))
+                    }
+                },
             }
         },
     )
@@ -568,6 +591,51 @@ mod tests {
         );
         assert!(text.contains("[DONE]"));
         assert_eq!(text.matches("data: ").count(), text.matches("\n\n").count());
+    }
+
+    #[tokio::test]
+    async fn upstream_error_mid_stream_flushes_the_held_back_tail_before_erroring() {
+        // A content delta whose trailing chars are held back for split-tag
+        // safety, then an upstream drop. The abort must still deliver the
+        // held-back tail (before surfacing the error) — otherwise the last
+        // characters of already-generated text are silently truncated on top of
+        // losing the rest (the "cut off mid-word" bug on an unstable local
+        // server). The clean-EOF path already flushes; this covers the error path.
+        let delta = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello world\"}}]}\n\n";
+        let upstream: ByteStream = Box::pin(futures::stream::iter(vec![
+            Ok(Bytes::from(delta)),
+            Err(ProxyError::Upstream("connection reset".to_string())),
+        ]));
+        let mut out = Box::pin(sse_think_stream(upstream));
+        let mut text = String::new();
+        let mut saw_error = false;
+        while let Some(item) = out.next().await {
+            match item {
+                Ok(bytes) => text.push_str(&String::from_utf8_lossy(&bytes)),
+                Err(_) => {
+                    saw_error = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_error,
+            "the upstream error must still surface to the client"
+        );
+        // The full visible text survived the abort (the ≤HOLDBACK tail flushed).
+        let visible: String = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|p| serde_json::from_str::<Value>(p).ok())
+            .filter_map(|v| {
+                v.pointer("/choices/0/delta/content")
+                    .and_then(|c| c.as_str().map(String::from))
+            })
+            .collect();
+        assert_eq!(
+            visible, "Hello world",
+            "held-back tail lost on abort: {text}"
+        );
     }
 
     #[tokio::test]
