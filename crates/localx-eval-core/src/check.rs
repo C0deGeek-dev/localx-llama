@@ -16,6 +16,11 @@ use std::time::Duration;
 /// Cap on captured check output before truncation.
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 
+/// Windows `CREATE_NO_WINDOW`: the check gets its own console (with no
+/// window) instead of attaching to the host's — see `run_command`.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Default per-check timeout. Full checks (test suites) can be slow.
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
@@ -243,9 +248,24 @@ impl<'a, G: CommandGate> CheckRunner<'a, G> {
         process
             .args(&command.args)
             .current_dir(self.root)
+            // Never inherit the host's stdin: checks run next to interactive
+            // TUIs (LocalPilot's chat REPL), and a check that reads stdin
+            // would consume the terminal's keystrokes — including the Ctrl+C
+            // key event raw mode relies on. A check that wants input gets
+            // immediate EOF instead of hanging until the timeout.
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Isolate the check from the host's terminal: on Windows a shared
+        // console would let the child read `CONIN$` or re-cook the console
+        // mode with `SetConsoleMode`; on Unix a new (never-foreground)
+        // process group means a direct `/dev/tty` read gets SIGTTIN instead
+        // of the host's input.
+        #[cfg(windows)]
+        process.creation_flags(CREATE_NO_WINDOW);
+        #[cfg(unix)]
+        process.process_group(0);
 
         let child = match process.spawn() {
             Ok(child) => child,
