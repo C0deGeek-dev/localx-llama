@@ -54,6 +54,27 @@ const CLOSE: &str = "</think>";
 /// across chunk boundaries is never emitted half-formed.
 const HOLDBACK: usize = 7;
 
+/// Safety valve for a `<think>` span that never closes. If the buffered
+/// in-think span grows past this many bytes without a `</think>` arriving,
+/// `push` gives up waiting, flips back to visible-text mode, and flushes the
+/// whole span as ordinary text instead of holding it hostage until
+/// [`ThinkStripper::finish`] — which never runs if the caller gives up on the
+/// stream (kills the connection) before it ends naturally.
+///
+/// Tuned for two competing needs: large enough that a genuine long reasoning
+/// trace is never truncated mid-thought (`keep_thinking = true` routes
+/// straight to the server with real reasoning left in, and a verbose local
+/// reasoning model can run several thousand tokens before closing
+/// `</think>`), but small enough that a false-positive `<think>` match (the
+/// bug this valve exists for) can't hold the visible reply hostage for
+/// approximately the rest of the turn — the turn's hard ceiling is
+/// `LocalModelMaxOutputTokens`, 16384 tokens by default (~60-90KB of text),
+/// so this is deliberately well under half of that. Far larger than
+/// `CLOSE.len()` (8), so there is no interaction with the `HOLDBACK`
+/// split-tag math above: this only ever fires long after any plausible
+/// tag-split ambiguity has resolved one way or the other.
+const THINK_BAILOUT: usize = 32 * 1024;
+
 /// Strip every `<think>…</think>` span from a complete string.
 ///
 /// An unterminated `<think>` flushes its remainder as visible text instead of
@@ -94,6 +115,13 @@ pub fn fallback_if_empty(stripped: &str) -> String {
 
 /// Streaming `<think>` stripper for SSE. Feed chunks; it emits only text that is
 /// safe to forward, holding back a short tail that might be a split tag.
+///
+/// A `<think>` span with no matching `</think>` is held in full until either
+/// the close tag arrives or the stream ends — except past `THINK_BAILOUT`
+/// bytes, at which point `push` gives up on it as reasoning and flushes it as
+/// visible text right away, so a misclassified span can't stall the visible
+/// reply for the rest of the turn if the caller gives up on the stream
+/// before it ends naturally.
 #[derive(Debug, Default)]
 pub struct ThinkStripper {
     buf: String,
@@ -117,17 +145,37 @@ impl ThinkStripper {
                         self.buf.drain(..j + CLOSE.len());
                         self.in_think = false;
                     }
+                    None if self.buf.len() > THINK_BAILOUT => {
+                        // The span has run well past any plausible reasoning
+                        // length without a `</think>` in sight — most likely
+                        // a false-positive `<think>` match on ordinary text
+                        // (or, at worst, a real one the model never closed).
+                        // Give up waiting: the whole buffered span becomes
+                        // ordinary visible text (the opening tag itself was
+                        // already drained above when it was found, so `buf`
+                        // holds exactly the text that followed it), and
+                        // normal streaming resumes for anything after — this
+                        // `continue` re-enters the loop with `in_think` now
+                        // false, so a fresh `<think>` later in the stream is
+                        // still detected correctly.
+                        out.push_str(&self.buf);
+                        self.buf.clear();
+                        self.in_think = false;
+                        continue;
+                    }
                     None => {
                         // Nothing is emitted from this branch, so — unlike the
                         // visible-text branch below — there is no holdback
                         // hazard here: retain the WHOLE buffered span. It is
                         // dropped in one shot once `</think>` is found, or
                         // recovered by `finish()` as visible fallback text if
-                        // the tag never closes. Trimming this to a short tail
-                        // on every push (the old behaviour) silently threw
-                        // away almost all of a long unterminated `<think>`
-                        // well before end-of-stream, so `finish()` alone could
-                        // never recover it.
+                        // the tag never closes (or, past `THINK_BAILOUT`
+                        // bytes, flushed immediately above instead of waiting
+                        // for either). Trimming this to a short tail on every
+                        // push (the old behaviour) silently threw away almost
+                        // all of a long unterminated `<think>` well before
+                        // end-of-stream, so `finish()` alone could never
+                        // recover it.
                         break;
                     }
                 }
@@ -156,7 +204,10 @@ impl ThinkStripper {
     /// legitimate answer that happened to follow a stray or malformed
     /// `<think>` is worse than the alternative: real hidden reasoning that
     /// never closes by end of turn leaking into the visible reply as raw
-    /// text.
+    /// text. In practice this only ever sees a span shorter than
+    /// `THINK_BAILOUT`: anything longer was already flushed by `push` itself,
+    /// so a stream that's abandoned mid-turn (connection dropped) no longer
+    /// strands buffered content unrecovered either way.
     pub fn finish(&mut self) -> String {
         self.in_think = false;
         std::mem::take(&mut self.buf)
@@ -485,6 +536,49 @@ mod tests {
         }
         out.push_str(&s.finish());
         assert_eq!(out, "answer this is a long unterminated reasoning span");
+    }
+
+    #[test]
+    fn think_span_under_bailout_is_still_buffered_until_finish() {
+        // Unchanged behavior: a genuinely long but still-plausible reasoning
+        // span, one byte short of THINK_BAILOUT, is not affected by the new
+        // safety valve — still held in full and only recovered by finish().
+        let mut s = ThinkStripper::new();
+        let long = "r".repeat(THINK_BAILOUT - 1);
+        let mut out = s.push("answer <think>");
+        out.push_str(&s.push(&long));
+        assert_eq!(out, "answer ", "must not flush before finish(): {out}");
+        out.push_str(&s.finish());
+        assert_eq!(out, format!("answer {long}"));
+    }
+
+    #[test]
+    fn think_span_over_bailout_flushes_immediately_as_visible_text() {
+        let mut s = ThinkStripper::new();
+        let mut out = s.push("answer <think>");
+        let long = "r".repeat(THINK_BAILOUT + 1);
+        out.push_str(&s.push(&long));
+        // Flushed mid-stream, not held until finish().
+        assert_eq!(out, format!("answer {long}"));
+    }
+
+    #[test]
+    fn text_after_bailout_streams_normally_not_held_as_thinking() {
+        let mut s = ThinkStripper::new();
+        s.push("answer <think>");
+        s.push(&"r".repeat(THINK_BAILOUT + 1));
+        // Resumed in ordinary visible-text mode: this delta streams through
+        // the normal small HOLDBACK-byte holdback, not the "withhold
+        // everything until </think> or finish()" in-think behavior — proving
+        // `in_think` was reset to `false`, not just flushed once.
+        let out = s.push(" more visible text after bailout");
+        assert!(
+            out.starts_with(" more visible text after"),
+            "text after bail-out did not stream normally: {out:?}"
+        );
+        let mut all = out;
+        all.push_str(&s.finish());
+        assert_eq!(all, " more visible text after bailout");
     }
 
     #[test]
