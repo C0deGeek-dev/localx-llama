@@ -5,7 +5,7 @@
 //! hard-won invariant:
 //!
 //! 1. Strip `<think>…</think>` from responses, **split-tag-safe** across SSE chunks.
-//! 2. Substitute `[no output]` when a turn strips to empty (unterminated `<think>`).
+//! 2. Substitute `[no output]` when a turn strips to empty.
 //! 3. Strip Anthropic thinking-config keys from a request **at the root only** —
 //!    never recursively, or tool payloads that happen to contain a `reasoning`
 //!    field are silently corrupted.
@@ -56,7 +56,8 @@ const HOLDBACK: usize = 7;
 
 /// Strip every `<think>…</think>` span from a complete string.
 ///
-/// An unterminated `<think>` drops everything from the tag onward.
+/// An unterminated `<think>` flushes its remainder as visible text instead of
+/// dropping it — see [`ThinkStripper::finish`] for why.
 pub fn strip_think(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
@@ -70,7 +71,10 @@ pub fn strip_think(input: &str) -> String {
                 out.push_str(&rest[..o]);
                 let after = &rest[o + OPEN.len()..];
                 match after.find(CLOSE) {
-                    None => break, // unterminated -> drop remainder
+                    None => {
+                        out.push_str(after);
+                        break;
+                    }
                     Some(c) => rest = &after[c + CLOSE.len()..],
                 }
             }
@@ -114,8 +118,16 @@ impl ThinkStripper {
                         self.in_think = false;
                     }
                     None => {
-                        // keep only a possible partial close tag
-                        self.trim_to_holdback();
+                        // Nothing is emitted from this branch, so — unlike the
+                        // visible-text branch below — there is no holdback
+                        // hazard here: retain the WHOLE buffered span. It is
+                        // dropped in one shot once `</think>` is found, or
+                        // recovered by `finish()` as visible fallback text if
+                        // the tag never closes. Trimming this to a short tail
+                        // on every push (the old behaviour) silently threw
+                        // away almost all of a long unterminated `<think>`
+                        // well before end-of-stream, so `finish()` alone could
+                        // never recover it.
                         break;
                     }
                 }
@@ -136,15 +148,18 @@ impl ThinkStripper {
         out
     }
 
-    /// Flush any held-back text at end of stream. An unterminated `<think>`
-    /// yields nothing.
+    /// Flush any held-back text at end of stream. An unterminated `<think>` —
+    /// the model's generation ended before a matching `</think>` ever
+    /// arrived — is no longer silently discarded: whatever is buffered (the
+    /// content after the stray/incomplete opening tag) is flushed as
+    /// ordinary visible text, exactly like the no-tag case. Losing a
+    /// legitimate answer that happened to follow a stray or malformed
+    /// `<think>` is worse than the alternative: real hidden reasoning that
+    /// never closes by end of turn leaking into the visible reply as raw
+    /// text.
     pub fn finish(&mut self) -> String {
-        if self.in_think {
-            self.buf.clear();
-            String::new()
-        } else {
-            std::mem::take(&mut self.buf)
-        }
+        self.in_think = false;
+        std::mem::take(&mut self.buf)
     }
 
     /// Emit everything except a trailing tail that could begin a tag.
@@ -153,11 +168,6 @@ impl ThinkStripper {
         let emitted: String = self.buf[..keep].to_string();
         self.buf.drain(..keep);
         emitted
-    }
-
-    fn trim_to_holdback(&mut self) {
-        let keep = self.holdback_start();
-        self.buf.drain(..keep);
     }
 
     /// Byte index up to which the buffer is safe to release.
@@ -436,7 +446,7 @@ mod tests {
     fn strip_think_one_shot() {
         assert_eq!(strip_think("a<think>x</think>b"), "ab");
         assert_eq!(strip_think("no tags"), "no tags");
-        assert_eq!(strip_think("open<think>never closed"), "open");
+        assert_eq!(strip_think("open<think>never closed"), "opennever closed");
         assert_eq!(strip_think("<think>a</think><think>b</think>tail"), "tail");
     }
 
@@ -453,12 +463,28 @@ mod tests {
     }
 
     #[test]
-    fn streaming_unterminated_think_drops_tail() {
+    fn streaming_unterminated_think_flushes_tail_as_visible_text() {
         let mut s = ThinkStripper::new();
         let mut out = s.push("visible <thi");
         out.push_str(&s.push("nk>hidden forever"));
         out.push_str(&s.finish());
-        assert_eq!(out, "visible ");
+        assert_eq!(out, "visible hidden forever");
+    }
+
+    #[test]
+    fn streaming_unterminated_think_recovers_full_span_across_many_chunks() {
+        // Regression test for the deeper bug: the old `push()` trimmed the
+        // in-think buffer down to a short tail on EVERY chunk, not just at
+        // `finish()` — so a `finish()`-only fix would still lose everything
+        // but the last few bytes of a long unterminated span. Feed it one
+        // character at a time and require the WHOLE thing back.
+        let mut s = ThinkStripper::new();
+        let mut out = s.push("answer <think>");
+        for ch in "this is a long unterminated reasoning span".chars() {
+            out.push_str(&s.push(&ch.to_string()));
+        }
+        out.push_str(&s.finish());
+        assert_eq!(out, "answer this is a long unterminated reasoning span");
     }
 
     #[test]
