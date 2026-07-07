@@ -116,6 +116,13 @@ pub struct ProxyConfig {
     /// When set, every non-`/health` request must carry this bearer token —
     /// the LAN-gateway posture (a public bind without a key is refused by
     /// the launcher's serve guard before the proxy ever starts).
+    ///
+    /// The key gates access, not confidentiality: the proxy speaks plain
+    /// HTTP, so on anything wider than a trusted LAN the key and all traffic
+    /// are observable in transit — put a VPN or TLS reverse proxy in front
+    /// for anything else. `GET /health` is deliberately unauthenticated (the
+    /// launcher's reuse/repoint probes need it pre-auth) and reports the
+    /// upstream target host/port to anyone who can reach the listener.
     pub api_key: Option<String>,
 }
 
@@ -144,6 +151,22 @@ async fn health<U: Upstream>(State(state): State<Arc<ProxyState<U>>>) -> Json<Va
     }))
 }
 
+/// Constant-time bearer-token check: both tokens are SHA-256-hashed and the
+/// digests compared with a branch-free fold, so the comparison cost never
+/// depends on how many leading bytes match (a plain `==` short-circuits at
+/// the first difference and leaks match length through timing). Hashing
+/// first also equalizes token-length differences.
+fn token_matches(presented: &str, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let presented = Sha256::digest(presented.as_bytes());
+    let expected = Sha256::digest(expected.as_bytes());
+    presented
+        .iter()
+        .zip(expected.iter())
+        .fold(0_u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
+}
+
 async fn proxy_handler<U: Upstream>(
     State(state): State<Arc<ProxyState<U>>>,
     req: axum::extract::Request,
@@ -154,12 +177,12 @@ async fn proxy_handler<U: Upstream>(
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .is_some_and(|token| token == expected)
+            .is_some_and(|token| token_matches(token, expected))
             || req
                 .headers()
                 .get("x-api-key")
                 .and_then(|v| v.to_str().ok())
-                .is_some_and(|token| token == expected);
+                .is_some_and(|token| token_matches(token, expected));
         if !authorized {
             return status_body(StatusCode::UNAUTHORIZED, "missing or wrong api key");
         }
@@ -771,6 +794,18 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn the_token_check_matches_exactly_and_only_exactly() {
+        // The digest-fold comparison must be a faithful equality test —
+        // constant-time hardening cannot change what matches.
+        assert!(super::token_matches("secret", "secret"));
+        assert!(!super::token_matches("secreT", "secret"));
+        assert!(!super::token_matches("secret ", "secret"));
+        assert!(!super::token_matches("", "secret"));
+        assert!(!super::token_matches("secre", "secret"));
+        assert!(super::token_matches("", ""));
     }
 
     #[tokio::test]
