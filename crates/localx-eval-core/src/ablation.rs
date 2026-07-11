@@ -313,6 +313,7 @@ mod tests {
                 retrieval_count: u32::from(retrieval),
                 exit_reason: "Done".to_string(),
                 recovered_after_failure: false,
+                interventions: 0,
                 discipline: None,
             },
             speed: SpeedBlock {

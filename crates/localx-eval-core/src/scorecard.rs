@@ -171,6 +171,11 @@ pub struct ProcessBlock {
     /// After a failed call, a later grounded success followed — the agent
     /// recovered rather than giving up or claiming on the failure.
     pub recovered_after_failure: bool,
+    /// External-driver interventions during the run (steers, cancellations,
+    /// permission denials from a driving/coaching client). `0` for an undriven
+    /// run; defaults on older scorecards that predate the field.
+    #[serde(default)]
+    pub interventions: u32,
     /// The per-capability discipline rates, when a rollup is attached (a
     /// producer that computes none leaves this `null`).
     pub discipline: Option<DisciplineMetrics>,
@@ -335,6 +340,7 @@ mod tests {
                 retrieval_count: 2,
                 exit_reason: "Done".to_string(),
                 recovered_after_failure: false,
+                interventions: 0,
                 discipline: None,
             },
             speed: SpeedBlock {
