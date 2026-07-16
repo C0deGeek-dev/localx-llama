@@ -629,6 +629,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prism_anthropic_stream_is_normalized_before_reaching_the_client() {
+        let sse = "event: message_start\n\
+                   data: {\"type\":\"message_start\",\"message\":{\"content\":[]}}\n\n\
+                   event: content_block_delta\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n\
+                   event: content_block_stop\n\
+                   data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                   event: message_delta\n\
+                   data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+                   event: message_stop\n\
+                   data: {\"type\":\"message_stop\"}\n\n";
+        let st = state_with(
+            MockUpstream::responding(200, Some("text/event-stream"), sse.as_bytes()),
+            None,
+        );
+        let app = router(st);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .body(Body::from(
+                r#"{"stream":true,"messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), MAX_BODY_BYTES)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        let start_at = text.find("content_block_start").expect("start synthesized");
+        let answer_at = text.rfind(r#""text":"OK""#).expect("answer retained");
+        let block_stop_at = text.find("content_block_stop").expect("stop retained");
+        let message_delta_at = text.find("message_delta").expect("delta retained");
+        let message_stop_at = text.find("message_stop").expect("completion retained");
+        assert!(
+            start_at < answer_at
+                && answer_at < block_stop_at
+                && block_stop_at < message_delta_at
+                && message_delta_at < message_stop_at,
+            "invalid downstream lifecycle: {text}"
+        );
+    }
+
+    #[tokio::test]
     async fn upstream_error_mid_stream_flushes_the_held_back_tail_before_erroring() {
         // A content delta whose trailing chars are held back for split-tag
         // safety, then an upstream drop. The abort must still deliver the

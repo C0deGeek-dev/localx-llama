@@ -12,6 +12,8 @@
 //! 4. Merge mid-conversation system messages into the top-level `system` field,
 //!    because Qwen chat templates hard-reject a system message after the start.
 
+use std::collections::BTreeSet;
+
 use serde_json::Value;
 
 /// Substituted for an assistant turn that strips to nothing.
@@ -285,6 +287,11 @@ pub struct SseThinkFilter {
     pending: Vec<u8>,
     stripper: ThinkStripper,
     shape: Option<DeltaShape>,
+    /// Anthropic content blocks whose start has reached the downstream client.
+    /// Some llama.cpp-compatible servers omit `content_block_start`; tracking
+    /// indices lets the proxy synthesize that missing lifecycle event exactly
+    /// once without duplicating starts from conforming servers.
+    anthropic_open_blocks: BTreeSet<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -292,7 +299,7 @@ enum DeltaShape {
     /// OpenAI: `choices[0].delta.content`.
     OpenAi,
     /// Anthropic: `delta.text` (type `text_delta`).
-    Anthropic,
+    Anthropic { index: u64 },
 }
 
 impl SseThinkFilter {
@@ -333,13 +340,40 @@ impl SseThinkFilter {
 
     fn transform_event(&mut self, event: &str) -> String {
         let mut lines: Vec<String> = Vec::new();
+        let event_json = event.lines().find_map(|line| {
+            line.strip_prefix("data:")
+                .and_then(|payload| serde_json::from_str::<Value>(payload.trim()).ok())
+        });
+        let event_type = event_json
+            .as_ref()
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str);
+        let event_index = event_json
+            .as_ref()
+            .and_then(|value| value.get("index"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        if event_type == Some("content_block_start") {
+            self.anthropic_open_blocks.insert(event_index);
+        } else if event_type == Some("content_block_delta")
+            && event_json
+                .as_ref()
+                .and_then(|value| value.pointer("/delta/type"))
+                .and_then(Value::as_str)
+                == Some("text_delta")
+            && self.anthropic_open_blocks.insert(event_index)
+        {
+            lines.push(anthropic_text_start_frame(event_index));
+        }
+
         // Release the stripper's held-back tail (up to `HOLDBACK` bytes withheld
         // for split-tag safety) as an in-band content frame *before* a stream
-        // terminator (`[DONE]` / `message_stop`). A consumer ends the stream at
-        // the terminator, so a tail emitted after it — as `finish()` alone would
-        // — is dropped, silently truncating the last few characters of every
-        // response. Flushing here puts those characters ahead of the terminator.
-        if is_terminal_marker(event) {
+        // terminator (`[DONE]` / `message_stop`) or Anthropic's block stop. A
+        // consumer ends a content block at `content_block_stop`, so emitting a
+        // held tail later would violate the lifecycle even if it still precedes
+        // `message_stop`.
+        if is_terminal_marker(event) || event_type == Some("content_block_stop") {
             let tail = self.stripper.finish();
             if !tail.is_empty() {
                 if let Some(frame) = self.shape.map(|s| s.data_frame(&tail)) {
@@ -364,6 +398,12 @@ impl SseThinkFilter {
                 lines.push(line.to_string());
             }
         }
+        if event_type == Some("content_block_stop") {
+            self.anthropic_open_blocks.remove(&event_index);
+            if matches!(self.shape, Some(DeltaShape::Anthropic { index }) if index == event_index) {
+                self.shape = None;
+            }
+        }
         lines.concat()
     }
 
@@ -384,8 +424,9 @@ impl SseThinkFilter {
             .and_then(Value::as_str)
             == Some("text_delta")
         {
+            let index = v.get("index").and_then(Value::as_u64).unwrap_or(0);
             if let Some(Value::String(t)) = v.pointer_mut("/delta/text") {
-                self.shape = Some(DeltaShape::Anthropic);
+                self.shape = Some(DeltaShape::Anthropic { index });
                 let stripped = self.stripper.push(t);
                 *t = stripped;
                 return serde_json::to_string(&v).ok();
@@ -402,12 +443,26 @@ impl DeltaShape {
             DeltaShape::OpenAi => {
                 serde_json::json!({ "choices": [ { "delta": { "content": text } } ] })
             }
-            DeltaShape::Anthropic => {
-                serde_json::json!({ "type": "content_block_delta", "delta": { "type": "text_delta", "text": text } })
+            DeltaShape::Anthropic { index } => {
+                serde_json::json!({ "type": "content_block_delta", "index": index, "delta": { "type": "text_delta", "text": text } })
             }
         };
-        format!("data: {v}\n\n")
+        match self {
+            DeltaShape::OpenAi => format!("data: {v}\n\n"),
+            DeltaShape::Anthropic { .. } => {
+                format!("event: content_block_delta\ndata: {v}\n\n")
+            }
+        }
     }
+}
+
+fn anthropic_text_start_frame(index: u64) -> String {
+    let value = serde_json::json!({
+        "type": "content_block_start",
+        "index": index,
+        "content_block": { "type": "text", "text": "" }
+    });
+    format!("event: content_block_start\ndata: {value}\n\n")
 }
 
 /// Anthropic request keys stripped from the root by default.
@@ -785,6 +840,97 @@ mod tests {
             visible_before_terminator(&out),
             "Is there something specific",
             "tail stranded after message_stop: {out}"
+        );
+        let start_at = out.find("content_block_start").expect("start synthesized");
+        let tail_at = out.rfind("pecific").expect("held tail emitted");
+        let block_stop_at = out.find("content_block_stop").expect("block stop present");
+        assert!(
+            start_at < tail_at && tail_at < block_stop_at,
+            "bad order: {out}"
+        );
+        assert_eq!(
+            out.matches(r#""type":"content_block_start""#).count(),
+            1,
+            "start must be synthesized exactly once: {out}"
+        );
+    }
+
+    #[test]
+    fn prism_anthropic_stream_is_normalized_to_a_complete_block_lifecycle() {
+        // Prism's llama.cpp fork currently omits content_block_start. The
+        // think filter also holds a short visible tail, so that tail must be
+        // released before (not after) the upstream content_block_stop.
+        let upstream = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"content\":[]}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+        let mut filter = SseThinkFilter::new();
+        let out = filter.push(upstream) + &filter.finish();
+
+        let start_at = out.find("content_block_start").expect("start synthesized");
+        let text_at = out.rfind(r#""text":"OK""#).expect("text retained");
+        let block_stop_at = out.find("content_block_stop").expect("block stop retained");
+        let message_delta_at = out.find("message_delta").expect("message delta retained");
+        let message_stop_at = out.find("message_stop").expect("message stop retained");
+        assert!(
+            start_at < text_at
+                && text_at < block_stop_at
+                && block_stop_at < message_delta_at
+                && message_delta_at < message_stop_at,
+            "invalid Anthropic lifecycle: {out}"
+        );
+        assert_eq!(
+            out.matches(r#""type":"content_block_start""#).count(),
+            1,
+            "exactly one start expected: {out}"
+        );
+        assert!(
+            out[text_at..block_stop_at].contains(r#""index":0"#),
+            "synthetic tail must retain its block index: {out}"
+        );
+    }
+
+    #[test]
+    fn valid_anthropic_start_is_not_duplicated() {
+        let mut filter = SseThinkFilter::new();
+        let upstream = "event: content_block_start\n\
+data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\n\
+data: {\"type\":\"content_block_delta\",\"index\":3,\"delta\":{\"type\":\"text_delta\",\"text\":\"complete\"}}\n\n\
+event: content_block_stop\n\
+data: {\"type\":\"content_block_stop\",\"index\":3}\n\n";
+        let out = filter.push(upstream) + &filter.finish();
+
+        assert_eq!(
+            out.matches(r#""type":"content_block_start""#).count(),
+            1,
+            "valid start duplicated: {out}"
+        );
+        assert_eq!(visible_before_terminator(&out), "complete");
+        let tail_at = out.rfind("omplete").expect("tail retained");
+        let stop_at = out.find("content_block_stop").expect("stop retained");
+        assert!(tail_at < stop_at, "tail emitted after block stop: {out}");
+    }
+
+    #[test]
+    fn clean_eof_does_not_invent_an_anthropic_completion_marker() {
+        let mut filter = SseThinkFilter::new();
+        let mut out = filter.push(
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        );
+        out.push_str(&filter.finish());
+
+        assert!(out.contains("partial"));
+        assert!(!out.contains("message_stop"), "false completion: {out}");
+        assert!(
+            !out.contains("content_block_stop"),
+            "false block stop: {out}"
         );
     }
 
