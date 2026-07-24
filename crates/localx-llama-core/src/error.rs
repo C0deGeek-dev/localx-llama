@@ -23,6 +23,11 @@ pub enum CoreError {
     #[error("Spec-type '{spec}' (MTP) is not supported by the turboquant fork. Switch to native (mainline MTP) or mtpturbo (combined build).")]
     SpecTypeUnsupported { spec: String },
 
+    /// A draft model configured together with an explicit non-draft-simple
+    /// spec-type — one speculation engine per launch.
+    #[error("Spec-type '{spec}' conflicts with the configured draft model. A drafter runs as 'draft-simple'; drop the spec-type override or remove the draft module.")]
+    SpecTypeConflictsWithDraft { spec: String },
+
     /// A parser name with no known sampler/template mapping.
     #[error("Unknown parser: {0}")]
     UnknownParser(String),

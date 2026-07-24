@@ -167,6 +167,11 @@ pub struct ModelDef {
     /// Multimodal projector module id/path (enables `--mmproj` when resolved).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_module: Option<String>,
+    /// Draft-model module id/path for classic speculative decoding (enables
+    /// `--spec-draft-model` when resolved; the drafter must share the main
+    /// model's tokenizer or the server refuses at startup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_module: Option<String>,
     /// Human description shown in the picker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,

@@ -308,6 +308,9 @@ pub struct LaunchParams {
     pub strict: Option<bool>,
     /// Resolved multimodal projector path (enables `--mmproj`).
     pub vision_module_path: Option<String>,
+    /// Resolved draft-model path for classic speculative decoding (enables
+    /// `--spec-draft-model` as `draft-simple`).
+    pub draft_module_path: Option<String>,
     /// Spec-type override.
     pub spec_type: Option<String>,
     /// Max draft tokens for speculative decoding.
@@ -454,9 +457,29 @@ pub fn build_llama_server_args(
         a.extend(strict_sampler_args());
     }
 
-    // MTP speculative decoding (both fields required).
+    // Speculative decoding. A resolved draft model runs as `draft-simple`;
+    // any explicit spec-type other than that conflicts with it (one
+    // speculation engine per launch). Without a drafter, the MTP/spec path
+    // is unchanged (both fields required).
     let spec = p.spec_type.as_deref().or(def.spec_type.as_deref());
-    if let (Some(spec), Some(n)) = (spec, p.spec_draft_n_max) {
+    let draft_path = p
+        .draft_module_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty());
+    if let Some(path) = draft_path {
+        if let Some(spec) = spec.filter(|s| !s.trim().is_empty()) {
+            if !spec.eq_ignore_ascii_case("draft-simple") {
+                return Err(CoreError::SpecTypeConflictsWithDraft {
+                    spec: spec.to_ascii_lowercase(),
+                });
+            }
+        }
+        push2("--spec-type", "draft-simple".to_string(), &mut a);
+        push2("--spec-draft-model", path.to_string(), &mut a);
+        if let Some(n) = p.spec_draft_n_max.filter(|n| *n > 0) {
+            push2("--spec-draft-n-max", n.to_string(), &mut a);
+        }
+    } else if let (Some(spec), Some(n)) = (spec, p.spec_draft_n_max) {
         if !spec.trim().is_empty() && n > 0 {
             validate_spec_type(spec, mode)?;
             let emitted = spec_type_for_mode(spec, mode);
@@ -666,5 +689,67 @@ mod tests {
         };
         let args = build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &p).unwrap();
         assert!(args.join(" ").contains("--mmproj proj.gguf"));
+    }
+
+    #[test]
+    fn draft_module_emits_draft_simple_speculation() {
+        let d = base_def();
+        // A resolved drafter alone runs as draft-simple, byte-exact tail.
+        let p = LaunchParams {
+            draft_module_path: Some("drafter.gguf".into()),
+            ..Default::default()
+        };
+        let args = build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &p).unwrap();
+        let j = args.join(" ");
+        assert!(j.contains("--spec-type draft-simple --spec-draft-model drafter.gguf"));
+        assert!(!j.contains("--spec-draft-n-max"));
+        // Draft depth rides along when set.
+        let p = LaunchParams {
+            draft_module_path: Some("drafter.gguf".into()),
+            spec_draft_n_max: Some(6),
+            ..Default::default()
+        };
+        let args = build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &p).unwrap();
+        assert!(args.join(" ").contains(
+            "--spec-type draft-simple --spec-draft-model drafter.gguf --spec-draft-n-max 6"
+        ));
+        // An explicit draft-simple spec-type is redundant but compatible.
+        let p = LaunchParams {
+            draft_module_path: Some("drafter.gguf".into()),
+            spec_type: Some("draft-simple".into()),
+            ..Default::default()
+        };
+        assert!(build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &p).is_ok());
+        // The drafter works in prism mode too (no MTP there, but classic
+        // drafting is plain llama-server surface).
+        let p = LaunchParams {
+            draft_module_path: Some("drafter.gguf".into()),
+            ..Default::default()
+        };
+        assert!(build_llama_server_args(&d, "", Mode::PrismMl, "m.gguf", 8080, &p).is_ok());
+        // A blank path emits nothing draft-related.
+        let p = LaunchParams {
+            draft_module_path: Some("  ".into()),
+            ..Default::default()
+        };
+        let args = build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &p).unwrap();
+        assert!(!args.join(" ").contains("spec-draft-model"));
+    }
+
+    #[test]
+    fn draft_module_refuses_a_conflicting_spec_type() {
+        let mut d = base_def();
+        d.spec_type = Some("draft-mtp".into());
+        let p = LaunchParams {
+            draft_module_path: Some("drafter.gguf".into()),
+            spec_draft_n_max: Some(4),
+            ..Default::default()
+        };
+        // One speculation engine per launch: an MTP spec-type (from the model
+        // def or the call) cannot combine with a drafter.
+        assert!(matches!(
+            build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &p).unwrap_err(),
+            CoreError::SpecTypeConflictsWithDraft { .. }
+        ));
     }
 }

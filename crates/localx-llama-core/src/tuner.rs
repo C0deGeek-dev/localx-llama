@@ -125,6 +125,7 @@ impl Overrides {
             thinking_policy: None,
             strict: None,
             vision_module_path: None,
+            draft_module_path: None,
             spec_type: self.spec_type.clone(),
             spec_draft_n_max: self.spec_draft_n_max,
             extra_args: Vec::new(),
