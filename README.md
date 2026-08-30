@@ -40,7 +40,7 @@ cargo test --workspace
 cargo check --workspace
 ```
 
-Part of the LocalX ecosystem. Planning lives in the private LocalHub repo.
+Part of the LocalX ecosystem.
 
 ## License
 

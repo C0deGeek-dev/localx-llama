@@ -1,8 +1,8 @@
 # CLAUDE.md — localx-llama
 
 Shared Rust crate tier reused by LocalBox, LocalBench, and LocalPilot via
-**rev-pinned git dependencies** (not a submodule). Planning lives in the private
-LocalHub repo; this repo holds only its README and code.
+**rev-pinned git dependencies** (not a submodule). This repository holds the
+shared source, tests, and public developer documentation.
 
 ## Non-negotiables
 
