@@ -1,0 +1,50 @@
+# localx-llama
+
+Shared Rust crate tier for the LocalX stack — the primitives reused by
+**LocalBox**, **LocalBench**, and **LocalPilot**.
+
+| Crate | Responsibility |
+|---|---|
+| `localx-llama-core` | Pure domain: model definitions, `llama-server` argv builder, VRAM/quant-fit math, config precedence, tuner/AutoBest schema. No I/O. |
+| `localx-llama-runtime` | Process/network side behind cross-platform traits: server lifecycle, pin-verify + asset-selection *decision logic* (the HTTP fetch/install shell lives in the consuming app), CPU-only embed-serve, and the in-process no-think proxy (method/header-faithful forwarding + per-delta SSE `<think>` stripping). |
+| `localx-eval-core` | Evaluation primitives extracted from LocalPilot's harness: scorecard, blind judge, ablation, stack-detected grader. Shared by LocalPilot and LocalBench. |
+
+The tuner store keeps its document schema and measurement methodology as
+separate compatibility axes. Schema-1 files remain readable, but consumers
+only replay entries whose `tuner_version` matches the shared
+`CURRENT_TUNER_VERSION` constant; superseded measurements remain on disk for
+migration and diagnosis.
+
+## Consuming this repo
+
+Product repos depend on these crates via a **rev-pinned Cargo git dependency**
+(not a submodule):
+
+```toml
+[dependencies]
+localx-llama-core = { git = "https://github.com/C0deGeek-dev/localx-llama", rev = "<pinned-sha>" }
+```
+
+During active development, a local `[patch]` / path override is used for
+velocity; the rev is pinned at each checkpoint.
+
+## Toolchain
+
+MSRV **1.82**, edition **2021**, exact-pinned workspace deps, `#![forbid(unsafe_code)]`.
+Windows / Linux / macOS are equal tier-1 (matches the stack's ADR-0007).
+
+```
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo check --workspace
+```
+
+Part of the LocalX ecosystem. Planning lives in the private LocalHub repo.
+
+## License
+
+LocalX-owned source is available under the
+[PolyForm Noncommercial License 1.0.0](LICENSE). Commercial use requires a
+separate license. See [LICENSING.md](LICENSING.md) for the commercial contact,
+the 30 August 2026 licensing boundary, and third-party terms.

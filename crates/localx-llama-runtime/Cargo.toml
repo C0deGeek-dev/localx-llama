@@ -1,0 +1,29 @@
+[package]
+name = "localx-llama-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Process/network side of the llama.cpp stack: llama-server lifecycle, pin-verified download/install, CPU-only embed-serve, and the in-process no-think streaming filter — all behind cross-platform traits."
+
+[lints]
+workspace = true
+
+[dependencies]
+localx-llama-core = { path = "../localx-llama-core" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+dunce = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+# a netstat-class dep for socket->PID reaping lands with the consuming app layer.
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
