@@ -8,11 +8,13 @@
 pub enum CoreError {
     /// A `turbo3`/`turbo4` KV cache type was requested on a mode that lacks the
     /// turboquant-aware fork.
-    #[error("KV cache type '{ty}' requires a turboquant-aware fork. Pick a mainline type ({mainline}) or switch to llama.cpp turboquant or mtpturbo mode.")]
+    #[error("KV cache type '{ty}' requires a turboquant-aware fork. Pick a mainline type ({mainline}) or switch to llama.cpp turboquant mode.")]
     KvTypeNeedsFork { ty: String, mainline: String },
 
     /// A KV cache type outside both the mainline and turbo sets.
-    #[error("Unknown KV cache type '{ty}'. Mainline: {mainline}; turbo (turboquant/mtpturbo only): {turbo}.")]
+    #[error(
+        "Unknown KV cache type '{ty}'. Mainline: {mainline}; turbo (turboquant only): {turbo}."
+    )]
     UnknownKvType {
         ty: String,
         mainline: String,
@@ -20,7 +22,7 @@ pub enum CoreError {
     },
 
     /// An MTP spec-type requested in plain turboquant mode, which has no MTP path.
-    #[error("Spec-type '{spec}' (MTP) is not supported by the turboquant fork. Switch to native (mainline MTP) or mtpturbo (combined build).")]
+    #[error("Spec-type '{spec}' (MTP) is not supported by the turboquant fork. Switch to native, which speaks mainline MTP.")]
     SpecTypeUnsupported { spec: String },
 
     /// A draft model configured together with an explicit non-draft-simple

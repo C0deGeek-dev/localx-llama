@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::CoreError;
 
 /// The runtime backend a launch targets. `native` = mainline llama.cpp;
-/// `turboquant`/`mtpturbo` are the C0deGeek-dev forks with extra KV/spec
-/// support; `prismml` is the PrismML-Eng fork with ternary kernels.
+/// `turboquant` is the C0deGeek-dev fork with extra KV types; `prismml` is the
+/// PrismML-Eng fork with ternary kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -19,8 +19,6 @@ pub enum Mode {
     Native,
     /// turboquant fork (turbo3/turbo4 KV, no MTP).
     Turboquant,
-    /// mtpturbo fork (turbo KV + MTP spec-types).
-    Mtpturbo,
     /// PrismML fork (ternary kernels; mainline KV, no MTP).
     PrismMl,
 }
@@ -31,7 +29,6 @@ impl Mode {
         match self {
             Mode::Native => "native",
             Mode::Turboquant => "turboquant",
-            Mode::Mtpturbo => "mtpturbo",
             Mode::PrismMl => "prismml",
         }
     }

@@ -20,7 +20,7 @@ pub const TURBO_KV_TYPES: &[&str] = &["turbo3", "turbo4"];
 pub const MTP_SPEC_TYPES: &[&str] = &["draft-mtp", "mtp", "nextn"];
 
 fn mode_supports_turbo_kv(mode: Mode) -> bool {
-    matches!(mode, Mode::Turboquant | Mode::Mtpturbo)
+    matches!(mode, Mode::Turboquant)
 }
 
 /// Validate a KV cache type against the active mode.
@@ -55,20 +55,6 @@ pub fn validate_spec_type(spec: &str, mode: Mode) -> Result<(), CoreError> {
         return Err(CoreError::SpecTypeUnsupported { spec: s });
     }
     Ok(())
-}
-
-/// Translate the catalog's canonical spec-type to the fork's name at emit time.
-///
-/// mtpturbo renames `draft-mtp` to bare `mtp`; everything else passes through.
-pub fn spec_type_for_mode(spec: &str, mode: Mode) -> String {
-    if mode != Mode::Mtpturbo {
-        return spec.to_string();
-    }
-    if spec.eq_ignore_ascii_case("draft-mtp") {
-        "mtp".to_string()
-    } else {
-        spec.to_string()
-    }
 }
 
 /// Resolve active KV types: explicit -> per-model -> defaults (`q8_0`; V follows K).
@@ -482,8 +468,7 @@ pub fn build_llama_server_args(
     } else if let (Some(spec), Some(n)) = (spec, p.spec_draft_n_max) {
         if !spec.trim().is_empty() && n > 0 {
             validate_spec_type(spec, mode)?;
-            let emitted = spec_type_for_mode(spec, mode);
-            push2("--spec-type", emitted, &mut a);
+            push2("--spec-type", spec.to_string(), &mut a);
             push2("--spec-draft-n-max", n.to_string(), &mut a);
         }
     }
@@ -639,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn mtp_spec_translated_on_mtpturbo_rejected_on_turboquant() {
+    fn mtp_spec_rejected_on_turboquant_emitted_verbatim_on_native() {
         let d = base_def();
         let p = LaunchParams {
             spec_type: Some("draft-mtp".into()),
@@ -651,11 +636,11 @@ mod tests {
             build_llama_server_args(&d, "", Mode::Turboquant, "m.gguf", 8080, &p).unwrap_err(),
             CoreError::SpecTypeUnsupported { .. }
         ));
-        // mtpturbo renames draft-mtp -> mtp.
-        let args = build_llama_server_args(&d, "", Mode::Mtpturbo, "m.gguf", 8080, &p).unwrap();
+        // Native takes the catalog's canonical spelling through unchanged: no
+        // mode renames the spec-type any more.
+        let args = build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &p).unwrap();
         let j = args.join(" ");
-        assert!(j.contains("--spec-type mtp --spec-draft-n-max 4"));
-        assert!(!j.contains("draft-mtp"));
+        assert!(j.contains("--spec-type draft-mtp --spec-draft-n-max 4"));
     }
 
     #[test]
