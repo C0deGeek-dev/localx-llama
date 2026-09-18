@@ -123,6 +123,9 @@ impl Overrides {
             // The target build's spelling is the launcher's to fill in: a stored
             // profile records the intent, not the flag syntax.
             load_flags: crate::capabilities::LoadFlags::default(),
+            // A replayed tune carries its own placement; the launcher decides.
+            auto_fit: false,
+            fit_target_mib: None,
             ubatch_size: self.ubatch_size,
             batch_size: self.batch_size,
             threads: self.threads,

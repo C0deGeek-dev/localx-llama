@@ -14,6 +14,9 @@
 pub struct ServerCapabilities {
     /// `--load-mode` exists (the replacement for `--no-mmap` / `--mlock`).
     pub load_mode: bool,
+    /// `--fit` exists: the server places layers and MoE experts in free
+    /// device memory itself when no placement is given.
+    pub fit: bool,
 }
 
 impl ServerCapabilities {
@@ -26,6 +29,7 @@ impl ServerCapabilities {
     pub fn from_help(help: &str) -> Self {
         Self {
             load_mode: lists_option(help, "--load-mode"),
+            fit: lists_option(help, "--fit"),
         }
     }
 
@@ -72,6 +76,7 @@ mod tests {
 
     /// Excerpt of mainline `llama-server --help` (build 11034).
     const MAINLINE: &str = "\
+-fit,  --fit [on|off]                   whether to adjust unset arguments to fit in device memory ('on' or
 -lm,   --load-mode MODE                 model loading mode (default: auto)
                                         - auto: mmap, unless a device does not support it
                                         - none: no special loading mode
@@ -111,6 +116,14 @@ mod tests {
             ServerCapabilities::from_help(PRISM).load_flags(),
             LoadFlags::LoadMode
         );
+    }
+
+    #[test]
+    fn fit_is_read_from_its_own_entry_not_from_fit_target() {
+        assert!(ServerCapabilities::from_help(MAINLINE).fit);
+        assert!(!ServerCapabilities::from_help(TURBOQUANT).fit);
+        let only_target = "-fitt, --fit-target MiB0,MiB1,MiB2,...\n";
+        assert!(!ServerCapabilities::from_help(only_target).fit);
     }
 
     #[test]

@@ -273,6 +273,13 @@ pub struct LaunchParams {
     pub no_mmap: Option<bool>,
     /// How the target build spells `mlock` / `no_mmap` (from its own `--help`).
     pub load_flags: LoadFlags,
+    /// Let llama.cpp place the model (`--fit`) when nothing chose a placement:
+    /// no `-ngl`, no MoE CPU offload, no tensor override. Only for builds that
+    /// have `--fit`; otherwise `-ngl` defaults to every layer as before.
+    pub auto_fit: bool,
+    /// Free device memory `--fit` leaves per device (`--fit-target`, MiB),
+    /// emitted only when the server is placing the model.
+    pub fit_target_mib: Option<u32>,
     /// `--ubatch-size` (emitted when > 0).
     pub ubatch_size: Option<i64>,
     /// `--batch-size` (emitted when > 0).
@@ -307,6 +314,20 @@ pub struct LaunchParams {
     /// Extra raw args appended last (after the def's own extra args).
     pub extra_args: Vec<String>,
 }
+
+/// Raw arguments that choose a placement; any of them in extra args means the
+/// launch is placed by hand, so `--fit` must not be relied on.
+const PLACEMENT_ARGS: &[&str] = &[
+    "-ngl",
+    "--gpu-layers",
+    "--n-gpu-layers",
+    "-ncmoe",
+    "--n-cpu-moe",
+    "-ot",
+    "--override-tensor",
+    "--cpu-moe",
+    "-cmoe",
+];
 
 /// The model-loading flags for a launch, spelled the way the target build
 /// understands them.
@@ -369,16 +390,24 @@ pub fn build_llama_server_args(
         }
     }
 
-    // GPU layers: per-call (>0) -> per-model -> 999. Always emitted.
-    let ngl = p
-        .n_gpu_layers
-        .filter(|v| *v > 0)
-        .or(def.n_gpu_layers)
-        .unwrap_or(999);
-    push2("-ngl", ngl.to_string(), &mut a);
+    // GPU layers: per-call (>0) -> per-model -> 999, unless llama.cpp is
+    // left to place an unplaced model itself.
+    let explicit_ngl = p.n_gpu_layers.filter(|v| *v > 0).or(def.n_gpu_layers);
+    let n_cpu_moe = p.n_cpu_moe.or(def.n_cpu_moe).unwrap_or(0);
+    let overrides_tensors = def
+        .extra_args
+        .iter()
+        .chain(&p.extra_args)
+        .any(|arg| PLACEMENT_ARGS.contains(&arg.as_str()));
+    if p.auto_fit && explicit_ngl.is_none() && n_cpu_moe <= 0 && !overrides_tensors {
+        if let Some(margin) = p.fit_target_mib {
+            push2("--fit-target", margin.to_string(), &mut a);
+        }
+    } else {
+        push2("-ngl", explicit_ngl.unwrap_or(999).to_string(), &mut a);
+    }
 
     // MoE CPU offload.
-    let n_cpu_moe = p.n_cpu_moe.or(def.n_cpu_moe).unwrap_or(0);
     if n_cpu_moe > 0 {
         push2("--n-cpu-moe", n_cpu_moe.to_string(), &mut a);
     }
@@ -616,6 +645,44 @@ mod tests {
         // per-model extra args before per-call.
         assert!(j.ends_with("--from-def --from-call"));
         // ub<=b NOT enforced: both emitted verbatim even if equal.
+    }
+
+    #[test]
+    fn an_unplaced_launch_on_a_fit_build_lets_the_server_place_it() {
+        let d = base_def();
+        let auto = LaunchParams {
+            auto_fit: true,
+            fit_target_mib: Some(1536),
+            ..Default::default()
+        };
+        let args = build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &auto).unwrap();
+        assert!(!args.iter().any(|a| a == "-ngl"));
+        assert!(args.join(" ").contains("--fit-target 1536"));
+
+        // Any explicit placement keeps today's argv.
+        for placed in [
+            LaunchParams {
+                n_gpu_layers: Some(30),
+                ..auto.clone()
+            },
+            LaunchParams {
+                n_cpu_moe: Some(12),
+                ..auto.clone()
+            },
+            LaunchParams {
+                extra_args: vec!["-ot".into(), "blk\\.1\\.ffn=CPU".into()],
+                ..auto.clone()
+            },
+        ] {
+            let args =
+                build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &placed).unwrap();
+            assert!(args.iter().any(|a| a == "-ngl"), "{args:?}");
+            assert!(!args.iter().any(|a| a == "--fit-target"), "{args:?}");
+        }
+        // Without auto_fit (a build lacking --fit), nothing changes.
+        let off = LaunchParams::default();
+        let args = build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &off).unwrap();
+        assert!(args.join(" ").contains("-ngl 999"));
     }
 
     #[test]

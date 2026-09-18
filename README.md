@@ -13,7 +13,10 @@ llama.cpp builds disagree about launch flags: mainline replaced `--no-mmap` and
 `--mlock` with `--load-mode` and rejects the old spellings, while the forks keep
 them. The argv builder therefore takes the *intent* (`mlock`, `no_mmap`) plus
 the target build's `LoadFlags`, read from that binary's own help text; a
-launcher that cannot read it gets the long-standing flags.
+launcher that cannot read it gets the long-standing flags. The same help text
+says whether the build has `--fit`: a launcher may then set `auto_fit` so an
+unplaced launch (no `-ngl`, no MoE offload, no tensor override) omits `-ngl` and
+lets llama.cpp place the model, optionally with a `--fit-target` margin.
 
 llama.cpp ships its own memory fitter, `llama-fit-params`: given a model and
 a launch shape it prints, in seconds and without loading tensor data, how many
