@@ -6,7 +6,7 @@ Shared Rust crate tier for the LocalX stack — the primitives reused by
 | Crate | Responsibility |
 |---|---|
 | `localx-llama-core` | Pure domain: model definitions, `llama-server` argv builder, per-build launch capabilities (read from a binary's `--help`), VRAM/quant-fit math, config precedence, tuner/AutoBest schema. No I/O. |
-| `localx-llama-runtime` | Process/network side behind cross-platform traits: server lifecycle, a bounded `--help` read for capability detection, pin-verify + asset-selection *decision logic* (the HTTP fetch/install shell lives in the consuming app), CPU-only embed-serve, and the in-process no-think proxy (method/header-faithful forwarding + per-delta SSE `<think>` stripping). |
+| `localx-llama-runtime` | Process/network side behind cross-platform traits: server lifecycle, a bounded `--help` read for capability detection, a `llama-fit-params` runner, pin-verify + asset-selection *decision logic* (the HTTP fetch/install shell lives in the consuming app), CPU-only embed-serve, and the in-process no-think proxy (method/header-faithful forwarding + per-delta SSE `<think>` stripping). |
 | `localx-eval-core` | Evaluation primitives extracted from LocalPilot's harness: scorecard, blind judge, ablation, stack-detected grader. Shared by LocalPilot and LocalBench. |
 
 llama.cpp builds disagree about launch flags: mainline replaced `--no-mmap` and
@@ -14,6 +14,14 @@ llama.cpp builds disagree about launch flags: mainline replaced `--no-mmap` and
 them. The argv builder therefore takes the *intent* (`mlock`, `no_mmap`) plus
 the target build's `LoadFlags`, read from that binary's own help text; a
 launcher that cannot read it gets the long-standing flags.
+
+llama.cpp ships its own memory fitter, `llama-fit-params`: given a model and
+a launch shape it prints, in seconds and without loading tensor data, how many
+layers and which MoE expert tensors fit in free VRAM. `fit` (core) builds its
+arguments from the exact server argv — placement flags removed, server-only flags
+dropped, a `--fit-target` margin added — and reads its answer; `fit` (runtime)
+runs it. The fitter cannot see a vision projector or draft model, so callers
+widen the margin by their size.
 
 The tuner store keeps its document schema and measurement methodology as
 separate compatibility axes. Schema-1 files remain readable, but consumers

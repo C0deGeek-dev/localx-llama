@@ -168,6 +168,12 @@ pub trait Launcher {
     fn server_capabilities(&self, _mode: Mode) -> ServerCapabilities {
         ServerCapabilities::default()
     }
+    /// The `llama-fit-params` that ships with a mode's build, when installed.
+    ///
+    /// Default: none, so callers fall back to finding memory limits by trial.
+    fn fit_params_binary(&self, _mode: Mode) -> Option<PathBuf> {
+        None
+    }
     /// The `llama-bench` binary, when present.
     fn bench_binary(&self, non_interactive: bool) -> Option<PathBuf>;
     /// The `llama-perplexity` binary for a mode, when present.

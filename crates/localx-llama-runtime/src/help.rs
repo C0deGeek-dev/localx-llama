@@ -6,50 +6,20 @@
 //! read is bounded: a binary that hangs, cannot start, or prints nothing yields
 //! `None`, and the caller falls back to the long-standing flags.
 
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::tool::run_tool;
 
 /// Run `<binary> --help` and return its standard output.
 ///
 /// Returns `None` when the binary cannot be started, does not finish within
-/// `timeout` (it is killed), or prints nothing. Standard input is closed so a
-/// tool can never wait on the caller's terminal.
+/// `timeout` (it is killed), or prints nothing.
 #[must_use]
 pub fn read_help_output(binary: &Path, timeout: Duration) -> Option<String> {
-    let mut child = Command::new(binary)
-        .arg("--help")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + timeout;
-    // Drain stdout on a thread: help text is larger than a pipe buffer, so the
-    // child would block on write if nobody read while we wait for it to exit.
-    let (sender, receiver) = mpsc::channel();
-    if let Some(mut stdout) = child.stdout.take() {
-        std::thread::spawn(move || {
-            let mut text = String::new();
-            let read = stdout.read_to_string(&mut text).map(|_| text);
-            let _ = sender.send(read);
-        });
-    }
-    let text = receiver.recv_timeout(timeout).ok().and_then(Result::ok);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-    text.filter(|text| !text.trim().is_empty())
+    run_tool(binary, &["--help".to_string()], timeout)
+        .map(|output| output.stdout)
+        .filter(|text| !text.trim().is_empty())
 }
 
 #[cfg(test)]

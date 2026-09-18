@@ -7,6 +7,7 @@
 //! - [`model`] — model definitions, context/quant key resolution, load-time validation.
 //! - [`args`] — the `llama-server` argv builder + KV/spec-type gating + parser→sampler mapping.
 //! - [`capabilities`] — which launch flags a given `llama-server` build accepts, read from its `--help`.
+//! - [`fit`] — llama.cpp's memory fitter as an oracle: what it must be told, what its answer means.
 //! - [`vram`] — VRAM detection abstraction, quant-fit classification, KV-cache context math.
 //!
 //! Every carried behaviour is pinned by a golden test (plan §6.16).
@@ -17,6 +18,7 @@ pub mod args;
 pub mod capabilities;
 pub mod config;
 pub mod error;
+pub mod fit;
 pub mod launcher;
 pub mod model;
 pub mod quant;
