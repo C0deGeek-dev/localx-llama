@@ -5,9 +5,15 @@ Shared Rust crate tier for the LocalX stack — the primitives reused by
 
 | Crate | Responsibility |
 |---|---|
-| `localx-llama-core` | Pure domain: model definitions, `llama-server` argv builder, VRAM/quant-fit math, config precedence, tuner/AutoBest schema. No I/O. |
-| `localx-llama-runtime` | Process/network side behind cross-platform traits: server lifecycle, pin-verify + asset-selection *decision logic* (the HTTP fetch/install shell lives in the consuming app), CPU-only embed-serve, and the in-process no-think proxy (method/header-faithful forwarding + per-delta SSE `<think>` stripping). |
+| `localx-llama-core` | Pure domain: model definitions, `llama-server` argv builder, per-build launch capabilities (read from a binary's `--help`), VRAM/quant-fit math, config precedence, tuner/AutoBest schema. No I/O. |
+| `localx-llama-runtime` | Process/network side behind cross-platform traits: server lifecycle, a bounded `--help` read for capability detection, pin-verify + asset-selection *decision logic* (the HTTP fetch/install shell lives in the consuming app), CPU-only embed-serve, and the in-process no-think proxy (method/header-faithful forwarding + per-delta SSE `<think>` stripping). |
 | `localx-eval-core` | Evaluation primitives extracted from LocalPilot's harness: scorecard, blind judge, ablation, stack-detected grader. Shared by LocalPilot and LocalBench. |
+
+llama.cpp builds disagree about launch flags: mainline replaced `--no-mmap` and
+`--mlock` with `--load-mode` and rejects the old spellings, while the forks keep
+them. The argv builder therefore takes the *intent* (`mlock`, `no_mmap`) plus
+the target build's `LoadFlags`, read from that binary's own help text; a
+launcher that cannot read it gets the long-standing flags.
 
 The tuner store keeps its document schema and measurement methodology as
 separate compatibility axes. Schema-1 files remain readable, but consumers

@@ -7,6 +7,7 @@
 //! `ub <= b` is a hard llama-server invariant deliberately NOT enforced here —
 //! that is the tuner's responsibility.
 
+use crate::capabilities::LoadFlags;
 use crate::error::CoreError;
 use crate::model::{context_value, Mode, ModelDef};
 
@@ -270,6 +271,8 @@ pub struct LaunchParams {
     pub mlock: Option<bool>,
     /// Disable mmap.
     pub no_mmap: Option<bool>,
+    /// How the target build spells `mlock` / `no_mmap` (from its own `--help`).
+    pub load_flags: LoadFlags,
     /// `--ubatch-size` (emitted when > 0).
     pub ubatch_size: Option<i64>,
     /// `--batch-size` (emitted when > 0).
@@ -303,6 +306,28 @@ pub struct LaunchParams {
     pub spec_draft_n_max: Option<i64>,
     /// Extra raw args appended last (after the def's own extra args).
     pub extra_args: Vec<String>,
+}
+
+/// The model-loading flags for a launch, spelled the way the target build
+/// understands them.
+///
+/// Legacy builds take `--mlock` / `--no-mmap` as given. Builds with
+/// `--load-mode` reject those, so the same intent maps onto one mode: no mmap
+/// is `none`; locking alone keeps the mmap and locks it (`mmap+mlock`, what a
+/// bare `--mlock` always meant); both together load into RAM and lock it
+/// (`mlock`); neither leaves the build's default.
+#[must_use]
+pub fn load_args(mlock: bool, no_mmap: bool, flags: LoadFlags) -> Vec<String> {
+    let args: &[&str] = match (flags, mlock, no_mmap) {
+        (_, false, false) => &[],
+        (LoadFlags::Legacy, true, false) => &["--mlock"],
+        (LoadFlags::Legacy, false, true) => &["--no-mmap"],
+        (LoadFlags::Legacy, true, true) => &["--mlock", "--no-mmap"],
+        (LoadFlags::LoadMode, false, true) => &["--load-mode", "none"],
+        (LoadFlags::LoadMode, true, false) => &["--load-mode", "mmap+mlock"],
+        (LoadFlags::LoadMode, true, true) => &["--load-mode", "mlock"],
+    };
+    args.iter().map(|arg| (*arg).to_string()).collect()
 }
 
 /// Build the `llama-server` argument vector for a launch.
@@ -358,12 +383,11 @@ pub fn build_llama_server_args(
         push2("--n-cpu-moe", n_cpu_moe.to_string(), &mut a);
     }
 
-    if p.mlock.or(def.mlock).unwrap_or(false) {
-        a.push("--mlock".to_string());
-    }
-    if p.no_mmap.or(def.no_mmap).unwrap_or(false) {
-        a.push("--no-mmap".to_string());
-    }
+    a.extend(load_args(
+        p.mlock.or(def.mlock).unwrap_or(false),
+        p.no_mmap.or(def.no_mmap).unwrap_or(false),
+        p.load_flags,
+    ));
 
     if let Some(n) = p.ubatch_size {
         if n > 0 {
@@ -592,6 +616,47 @@ mod tests {
         // per-model extra args before per-call.
         assert!(j.ends_with("--from-def --from-call"));
         // ub<=b NOT enforced: both emitted verbatim even if equal.
+    }
+
+    #[test]
+    fn load_intent_maps_to_each_build_spelling() {
+        use LoadFlags::{Legacy, LoadMode};
+        let cases: [(LoadFlags, bool, bool, &[&str]); 8] = [
+            (Legacy, false, false, &[]),
+            (Legacy, true, false, &["--mlock"]),
+            (Legacy, false, true, &["--no-mmap"]),
+            (Legacy, true, true, &["--mlock", "--no-mmap"]),
+            (LoadMode, false, false, &[]),
+            (LoadMode, false, true, &["--load-mode", "none"]),
+            (LoadMode, true, false, &["--load-mode", "mmap+mlock"]),
+            (LoadMode, true, true, &["--load-mode", "mlock"]),
+        ];
+        for (flags, mlock, no_mmap, expected) in cases {
+            assert_eq!(
+                load_args(mlock, no_mmap, flags),
+                expected
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect::<Vec<_>>(),
+                "{flags:?} mlock={mlock} no_mmap={no_mmap}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_load_mode_build_never_receives_the_removed_flags() {
+        let mut d = base_def();
+        d.no_mmap = Some(true);
+        let p = LaunchParams {
+            mlock: Some(true),
+            load_flags: LoadFlags::LoadMode,
+            ..Default::default()
+        };
+        let args = build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &p).unwrap();
+        assert!(!args.iter().any(|a| a == "--no-mmap" || a == "--mlock"));
+        // Same slot as the legacy flags: right after the MoE offload / -ngl block.
+        let j = args.join(" ");
+        assert!(j.contains("-ngl 999 --load-mode mlock"), "{j}");
     }
 
     #[test]

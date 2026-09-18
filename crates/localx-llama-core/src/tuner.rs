@@ -120,6 +120,9 @@ impl Overrides {
             n_cpu_moe: self.n_cpu_moe,
             mlock: self.mlock,
             no_mmap: self.no_mmap,
+            // The target build's spelling is the launcher's to fill in: a stored
+            // profile records the intent, not the flag syntax.
+            load_flags: crate::capabilities::LoadFlags::default(),
             ubatch_size: self.ubatch_size,
             batch_size: self.batch_size,
             threads: self.threads,

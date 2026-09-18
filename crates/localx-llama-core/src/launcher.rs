@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::capabilities::ServerCapabilities;
 use crate::model::{Mode, ModelDef};
 
 /// The default target a benchmark consumes.
@@ -159,6 +160,14 @@ pub trait Launcher {
     /// # Errors
     /// [`LauncherError::Unavailable`] when the binary cannot be resolved.
     fn server_binary(&self, mode: Mode, non_interactive: bool) -> Result<PathBuf, LauncherError>;
+    /// Which launch flags the `llama-server` binary for a mode accepts.
+    ///
+    /// The default reports only the long-standing flags — what every build
+    /// understood before `--load-mode` — so a launcher that cannot run the
+    /// binary keeps today's argv. A launcher that can reads the binary's help.
+    fn server_capabilities(&self, _mode: Mode) -> ServerCapabilities {
+        ServerCapabilities::default()
+    }
     /// The `llama-bench` binary, when present.
     fn bench_binary(&self, non_interactive: bool) -> Option<PathBuf>;
     /// The `llama-perplexity` binary for a mode, when present.

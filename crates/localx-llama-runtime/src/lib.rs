@@ -11,6 +11,7 @@
 //! - [`proxy`] — the axum no-think proxy that composes the `nothink` transforms
 //!   into a method/header-faithful forwarder with per-delta SSE stripping.
 //! - [`server`] — server lifecycle decision logic (readiness vs listening).
+//! - [`help`] — bounded read of a llama.cpp tool's `--help`, for capability detection.
 //! - [`download`] — pin-verify + asset-selection *decision logic*; the HTTP
 //!   fetch/install shell lives in the consuming app (e.g. LocalBox `update.rs`).
 //!
@@ -21,6 +22,7 @@
 pub mod download;
 pub mod error;
 pub mod health;
+pub mod help;
 pub mod net;
 pub mod nothink;
 pub mod probe;
