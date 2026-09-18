@@ -161,13 +161,9 @@ fn split_shard(stem: &str) -> (&str, Option<(u32, u32)>) {
     }
 }
 
-/// The stable quant key denoted by a GGUF filename. Imatrix markers are kept
-/// so static and imatrix builds remain distinct candidates.
-#[must_use]
-pub fn quant_key_from_filename(name: &str) -> Option<String> {
-    let lower = name.to_ascii_lowercase();
-    let stem = lower.strip_suffix(".gguf")?;
-    let (base, _) = split_shard(stem);
+/// The `.`/`-` segments of a shard-free stem and the position of its last
+/// quant token.
+fn quant_segments(base: &str) -> Option<(Vec<&str>, usize)> {
     let segments: Vec<&str> = base
         .split(['.', '-'])
         .filter(|segment| !segment.is_empty())
@@ -175,15 +171,79 @@ pub fn quant_key_from_filename(name: &str) -> Option<String> {
     let index = segments
         .iter()
         .rposition(|segment| is_quant_token(segment))?;
+    Some((segments, index))
+}
+
+/// The stable quant key denoted by a GGUF filename. Imatrix markers are kept
+/// so static and imatrix builds remain distinct candidates.
+#[must_use]
+pub fn quant_key_from_filename(name: &str) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".gguf")?;
+    let (base, _) = split_shard(stem);
+    let (segments, index) = quant_segments(base)?;
     let key = compact(segments[index]);
     let imatrix = index > 0 && matches!(segments[index - 1], "i1" | "imat" | "imatrix");
     Some(if imatrix { format!("i1-{key}") } else { key })
 }
 
-fn shard_index(name: &str) -> u32 {
+/// A filename's lowercased stem without its shard suffix, and the
+/// `(index, total)` that suffix named, when it had one.
+fn shard_parts(name: &str) -> (String, Option<(u32, u32)>) {
     let lower = name.to_ascii_lowercase();
     let stem = lower.strip_suffix(".gguf").unwrap_or(&lower);
-    split_shard(stem).1.map_or(1, |(index, _)| index)
+    let (base, shard) = split_shard(stem);
+    (base.to_string(), shard)
+}
+
+fn shard_index(name: &str) -> u32 {
+    shard_parts(name).1.map_or(1, |(index, _)| index)
+}
+
+/// Leading filename markers of GGUFs that ship beside a model instead of
+/// being one: a multimodal projector (`mmproj-…`) or a multi-token-prediction
+/// draft head (`mtp-…`). Their names still carry a quant token
+/// (`mmproj-f16.gguf`, `mtp-Model-Q8_0.gguf`), which would otherwise make them
+/// look like a quant of the model.
+const AUXILIARY_PREFIXES: [&str; 2] = ["mmproj", "mtp"];
+
+fn is_auxiliary(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let file_name = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    file_name
+        .split(['.', '-', '_'])
+        .next()
+        .is_some_and(|first| AUXILIARY_PREFIXES.contains(&first))
+}
+
+/// A single file, or a split set holding exactly shards `1..=total`. A set
+/// with shards missing cannot be loaded as published — some repos ship only
+/// the shards that differ from another set and expect the rest to be copied
+/// in by hand — so it is no candidate at all.
+fn is_complete_set(parts: &[&QuantFile]) -> bool {
+    let shards: Vec<Option<(u32, u32)>> =
+        parts.iter().map(|file| shard_parts(&file.name).1).collect();
+    if let [None] = shards.as_slice() {
+        return true;
+    }
+    let Some(Some((_, total))) = shards.first().copied() else {
+        return false;
+    };
+    let mut indexes = Vec::with_capacity(shards.len());
+    for shard in shards {
+        match shard {
+            Some((index, set_total)) if set_total == total => indexes.push(index),
+            _ => return false,
+        }
+    }
+    indexes.sort_unstable();
+    indexes.into_iter().eq(1..=total)
+}
+
+/// How many name segments follow the quant token. A plain build ends on it
+/// (`Model-IQ4_XS`); a variant qualifies it (`Model-IQ4_XS-MTP`).
+fn qualifier_count(base: &str) -> usize {
+    quant_segments(base).map_or(usize::MAX, |(segments, index)| segments.len() - index - 1)
 }
 
 const MAX_SHARD_COUNT: u32 = 1024;
@@ -229,16 +289,36 @@ pub fn shard_files_from_primary(primary: &str) -> Vec<String> {
 
 /// Group GGUF files into stable quant candidates with ordered shards and a
 /// total size only when every file reported one.
+///
+/// Files group by quant key and then by the name they share once any shard
+/// suffix is removed, so each candidate is one loadable file set: projector
+/// and draft-head files are skipped, split sets with shards missing are
+/// dropped, and when several complete sets share a quant key the plain build
+/// wins over a qualified variant (ties go to the first name).
 #[must_use]
 pub fn quant_candidates(files: &[QuantFile]) -> Vec<QuantCandidate> {
-    let mut groups: BTreeMap<String, Vec<&QuantFile>> = BTreeMap::new();
+    let mut groups: BTreeMap<String, BTreeMap<String, Vec<&QuantFile>>> = BTreeMap::new();
     for file in files {
+        if is_auxiliary(&file.name) {
+            continue;
+        }
         if let Some(key) = quant_key_from_filename(&file.name) {
-            groups.entry(key).or_default().push(file);
+            groups
+                .entry(key)
+                .or_default()
+                .entry(shard_parts(&file.name).0)
+                .or_default()
+                .push(file);
         }
     }
     groups
         .into_iter()
+        .filter_map(|(key, sets)| {
+            sets.into_iter()
+                .filter(|(_, parts)| is_complete_set(parts))
+                .min_by_key(|(base, _)| qualifier_count(base))
+                .map(|(_, parts)| (key, parts))
+        })
         .map(|(key, mut parts)| {
             parts.sort_by_key(|file| shard_index(&file.name));
             let total_size = parts
@@ -511,6 +591,103 @@ mod tests {
         ]);
         assert_eq!(candidates[0].total_size, None);
         assert_eq!(candidates[0].files.len(), 2);
+    }
+
+    #[test]
+    fn a_split_set_with_shards_missing_is_no_candidate() {
+        let candidates = quant_candidates(&[
+            file("M-Q6_K-00001-of-00003.gguf", Some(10)),
+            file("M-Q6_K-00003-of-00003.gguf", Some(30)),
+            file("M-Q4_K_M-00002-of-00002.gguf", Some(20)),
+        ]);
+        assert!(candidates.is_empty(), "{candidates:?}");
+    }
+
+    #[test]
+    fn projector_and_draft_head_files_are_not_quants() {
+        let candidates = quant_candidates(&[
+            file("Model-Q4_K_M.gguf", Some(4)),
+            file("mmproj-Model-f16.gguf", Some(1)),
+            file("mmproj-F16.gguf", Some(1)),
+            file("mtp/mtp-Model-Q8_0.gguf", Some(2)),
+        ]);
+        let keys: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["q4km"]);
+    }
+
+    /// A real listing (spiritfather/Qwen3.8-Flash-Next-heretic-2-i1-GGUF): each
+    /// quant folder holds the full 5-shard build plus an `MTP/` patch set of
+    /// shards 1 and 6 of 6 whose README says to copy shards 2..5 in by hand,
+    /// and the repo root holds a standalone MTP draft head. Grouping by quant
+    /// token alone merged both sets into one candidate whose primary was the
+    /// patch shard, so a download asked for `-MTP-00002-of-00006`, which
+    /// does not exist.
+    #[test]
+    fn an_mtp_patch_set_beside_a_split_build_does_not_join_it() {
+        let files = vec![
+            file(
+                "IQ4_XS/MTP/Qwen3.8-Flash-Next-heretic-2-IQ4_XS-MTP-00001-of-00006.gguf",
+                Some(10_945_799),
+            ),
+            file(
+                "IQ4_XS/MTP/Qwen3.8-Flash-Next-heretic-2-IQ4_XS-MTP-00006-of-00006.gguf",
+                Some(2_775_623_808),
+            ),
+            file(
+                "IQ4_XS/Qwen3.8-Flash-Next-heretic-2-IQ4_XS-00001-of-00005.gguf",
+                Some(10_945_760),
+            ),
+            file(
+                "IQ4_XS/Qwen3.8-Flash-Next-heretic-2-IQ4_XS-00002-of-00005.gguf",
+                Some(682_434_912),
+            ),
+            file(
+                "IQ4_XS/Qwen3.8-Flash-Next-heretic-2-IQ4_XS-00003-of-00005.gguf",
+                Some(54_400_261_312),
+            ),
+            file(
+                "IQ4_XS/Qwen3.8-Flash-Next-heretic-2-IQ4_XS-00004-of-00005.gguf",
+                Some(47_566_147_392),
+            ),
+            file(
+                "IQ4_XS/Qwen3.8-Flash-Next-heretic-2-IQ4_XS-00005-of-00005.gguf",
+                Some(22_650_600_960),
+            ),
+            file(
+                "mtp/mtp-Qwen3.8-Flash-Next-heretic-2-Q8_0.gguf",
+                Some(4_137_429_280),
+            ),
+        ];
+        let candidates = quant_candidates(&files);
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        let iq4xs = &candidates[0];
+        assert_eq!(iq4xs.key, "iq4xs");
+        assert_eq!(
+            iq4xs.files,
+            (1..=5)
+                .map(|part| format!(
+                    "IQ4_XS/Qwen3.8-Flash-Next-heretic-2-IQ4_XS-{part:05}-of-00005.gguf"
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(iq4xs.total_size, Some(125_310_390_336));
+        // The primary expands to exactly the files the repo holds.
+        assert_eq!(shard_files_from_primary(&iq4xs.files[0]), iq4xs.files);
+    }
+
+    #[test]
+    fn a_plain_build_wins_over_a_complete_qualified_variant() {
+        let mut files: Vec<QuantFile> = (1..=2)
+            .map(|part| file(&format!("Q/M-Q4_K_M-MTP-{part:05}-of-00002.gguf"), Some(1)))
+            .collect();
+        files.push(file("M-Q4_K_M.gguf", Some(3)));
+        let candidates = quant_candidates(&files);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].files, vec!["M-Q4_K_M.gguf"]);
+        assert_eq!(candidates[0].total_size, Some(3));
     }
 
     #[test]
