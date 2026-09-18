@@ -315,6 +315,13 @@ pub struct LaunchParams {
     pub extra_args: Vec<String>,
 }
 
+/// Whether a speculative-decoding type drafts from n-grams of the context
+/// (`ngram-mod`, `ngram-simple`, ...) rather than from a draft model or head.
+#[must_use]
+pub fn is_ngram_spec(spec: &str) -> bool {
+    spec.trim().to_ascii_lowercase().starts_with("ngram-")
+}
+
 /// Raw arguments that choose a placement; any of them in extra args means the
 /// launch is placed by hand, so `--fit` must not be relied on.
 const PLACEMENT_ARGS: &[&str] = &[
@@ -518,11 +525,15 @@ pub fn build_llama_server_args(
         if let Some(n) = p.spec_draft_n_max.filter(|n| *n > 0) {
             push2("--spec-draft-n-max", n.to_string(), &mut a);
         }
-    } else if let (Some(spec), Some(n)) = (spec, p.spec_draft_n_max) {
-        if !spec.trim().is_empty() && n > 0 {
+    } else if let Some(spec) = spec.filter(|s| !s.trim().is_empty()) {
+        if let Some(n) = p.spec_draft_n_max.filter(|n| *n > 0) {
             validate_spec_type(spec, mode)?;
             push2("--spec-type", spec.to_string(), &mut a);
             push2("--spec-draft-n-max", n.to_string(), &mut a);
+        } else if is_ngram_spec(spec) {
+            // N-gram speculation drafts from the context itself and sizes its
+            // drafts with its own `--spec-ngram-*` defaults: no draft length.
+            push2("--spec-type", spec.to_string(), &mut a);
         }
     }
 
@@ -683,6 +694,29 @@ mod tests {
         let off = LaunchParams::default();
         let args = build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &off).unwrap();
         assert!(args.join(" ").contains("-ngl 999"));
+    }
+
+    #[test]
+    fn ngram_speculation_needs_no_draft_length() {
+        let d = base_def();
+        let ngram = LaunchParams {
+            spec_type: Some("ngram-mod".into()),
+            ..Default::default()
+        };
+        let j = build_llama_server_args(&d, "", Mode::Turboquant, "m.gguf", 8080, &ngram)
+            .unwrap()
+            .join(" ");
+        assert!(j.contains("--spec-type ngram-mod"), "{j}");
+        assert!(!j.contains("--spec-draft-n-max"), "{j}");
+        // A draft-model type still needs its length, exactly as before.
+        let mtp = LaunchParams {
+            spec_type: Some("draft-mtp".into()),
+            ..Default::default()
+        };
+        let j = build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &mtp)
+            .unwrap()
+            .join(" ");
+        assert!(!j.contains("--spec-type"), "{j}");
     }
 
     #[test]
