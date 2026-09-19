@@ -17,6 +17,11 @@ pub struct ServerCapabilities {
     /// `--fit` exists: the server places layers and MoE experts in free
     /// device memory itself when no placement is given.
     pub fit: bool,
+    /// `--lazy-mode` exists: by default (`auto`) the build reads a model's
+    /// per-layer embedding table from disk on demand when it is larger than
+    /// 4 GiB, and keeps it memory-mapped even when the model is loaded
+    /// without mmap, so that table never becomes private memory.
+    pub lazy_mode: bool,
 }
 
 impl ServerCapabilities {
@@ -30,6 +35,7 @@ impl ServerCapabilities {
         Self {
             load_mode: lists_option(help, "--load-mode"),
             fit: lists_option(help, "--fit"),
+            lazy_mode: lists_option(help, "--lazy-mode"),
         }
     }
 
@@ -124,6 +130,13 @@ mod tests {
         assert!(!ServerCapabilities::from_help(TURBOQUANT).fit);
         let only_target = "-fitt, --fit-target MiB0,MiB1,MiB2,...\n";
         assert!(!ServerCapabilities::from_help(only_target).fit);
+    }
+
+    #[test]
+    fn only_the_mainline_build_reads_tensors_lazily() {
+        assert!(ServerCapabilities::from_help(MAINLINE).lazy_mode);
+        assert!(!ServerCapabilities::from_help(TURBOQUANT).lazy_mode);
+        assert!(!ServerCapabilities::from_help(PRISM).lazy_mode);
     }
 
     #[test]

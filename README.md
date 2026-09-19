@@ -16,7 +16,10 @@ the target build's `LoadFlags`, read from that binary's own help text; a
 launcher that cannot read it gets the long-standing flags. The same help text
 says whether the build has `--fit`: a launcher may then set `auto_fit` so an
 unplaced launch (no `-ngl`, no MoE offload, no tensor override) omits `-ngl` and
-lets llama.cpp place the model, optionally with a `--fit-target` margin.
+lets llama.cpp place the model, optionally with a `--fit-target` margin. It
+also says whether the build has `--lazy-mode`: such a build reads a per-layer
+embedding table larger than 4 GiB from disk on demand and keeps it mapped even
+without mmap, which a caller needs to know to size a model's private memory.
 
 llama.cpp ships its own memory fitter, `llama-fit-params`: given a model and
 a launch shape it prints, in seconds and without loading tensor data, how many
