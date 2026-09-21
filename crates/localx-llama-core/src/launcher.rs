@@ -174,10 +174,6 @@ pub trait Launcher {
     fn fit_params_binary(&self, _mode: Mode) -> Option<PathBuf> {
         None
     }
-    /// The `llama-bench` binary, when present.
-    fn bench_binary(&self, non_interactive: bool) -> Option<PathBuf>;
-    /// The `llama-perplexity` binary for a mode, when present.
-    fn perplexity_binary(&self, non_interactive: bool, mode: Mode) -> Option<PathBuf>;
     /// The install root for a mode.
     fn install_root(&self, mode: Mode) -> PathBuf;
 
@@ -202,10 +198,6 @@ pub trait Launcher {
     fn stop_server(&self, quiet: bool);
     /// Record the active backend session for later stop/reap.
     fn set_backend_session(&self, session: &BackendSession);
-
-    // --- paths ---------------------------------------------------------------
-    /// Expand `%VAR%` / `~` style path spellings.
-    fn expand_path(&self, path: &str) -> PathBuf;
 }
 
 #[cfg(test)]
