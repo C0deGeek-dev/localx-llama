@@ -38,8 +38,8 @@ pub use ablation::{
     AblationArm, AttributionRow, CompositeOutcome, FeatureToggles,
 };
 pub use check::{
-    AllowAll, CheckCommand, CheckOutcome, CheckRunner, CheckSeverity, CheckSpec, CheckStatus,
-    CommandGate,
+    AllowAll, CancelSignal, CheckCommand, CheckOutcome, CheckRunner, CheckSeverity, CheckSpec,
+    CheckStatus, CommandEnd, CommandGate, CommandRun, EnvPolicy,
 };
 pub use discipline::DisciplineMetrics;
 pub use gate::{parse_provenance, GateCard, Provenance, Safety, Verdict};

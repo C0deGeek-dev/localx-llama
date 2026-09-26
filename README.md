@@ -7,7 +7,7 @@ Shared Rust crate tier for the LocalX stack — the primitives reused by
 |---|---|
 | `localx-llama-core` | Pure domain: model definitions, `llama-server` argv builder, per-build launch capabilities (read from a binary's `--help`), VRAM/quant-fit math, config precedence, tuner/AutoBest schema. No I/O. |
 | `localx-llama-runtime` | Process/network side behind cross-platform traits: server lifecycle, a bounded `--help` read for capability detection, a `llama-fit-params` runner, pin-verify + asset-selection *decision logic* (the HTTP fetch/install shell lives in the consuming app), CPU-only embed-serve, and the in-process no-think proxy (method/header-faithful forwarding + per-delta SSE `<think>` stripping). |
-| `localx-eval-core` | Evaluation primitives extracted from LocalPilot's harness: scorecard, blind judge, ablation, stack-detected grader. Shared by LocalPilot and LocalBench. |
+| `localx-eval-core` | Evaluation primitives extracted from LocalPilot's harness: scorecard, blind judge, ablation, stack-detected grader, and the gated check runner (timeout, cancellation, a host reap hook for the whole process tree, bounded capture, environment policy). Shared by LocalPilot and LocalBench. |
 
 llama.cpp builds disagree about launch flags: mainline replaced `--no-mmap` and
 `--mlock` with `--load-mode` and rejects the old spellings, while the forks keep
