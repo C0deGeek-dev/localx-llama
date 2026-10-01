@@ -17,6 +17,8 @@
 //!   fix-and-re-run orchestration; the host injects its command policy through
 //!   [`check::CommandGate`].
 //! - [`verify`] — stack detection for the verify-before-done command.
+//! - [`uplift`] — the content identity a lesson-off/on uplift receipt is bound
+//!   to, shared by the tool that emits a receipt and the host that requested it.
 //! - [`grade`] — grade fidelity (exit 0 AND tests_run > 0; Rust sums every
 //!   `test result:` line), fail-closed per language.
 //! - [`gate`] — provenance gating (offline artifacts can't satisfy a live
@@ -31,6 +33,7 @@ pub mod gate;
 pub mod grade;
 pub mod judge;
 pub mod scorecard;
+pub mod uplift;
 pub mod verify;
 
 pub use ablation::{
