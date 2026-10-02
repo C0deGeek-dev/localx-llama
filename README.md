@@ -1,13 +1,34 @@
-# localx-llama
+![localx-llama — Shared foundations for the LocalX tools.](docs/assets/readme-banner.svg)
 
-Shared Rust crate tier for the LocalX stack — the primitives reused by
-**LocalBox**, **LocalBench**, and **LocalPilot**.
+<div align="center">
+  <h1>localx-llama</h1>
+  <p><strong>Shared Rust libraries for model launching, runtime management, and evaluation.</strong></p>
+  <p><a href="#which-crate-do-i-need">Crates</a> · <a href="#consuming-this-repo">Integration</a> · <a href="#toolchain">Development checks</a></p>
+</div>
+
+## Choose your route
+
+| I want to… | Start here |
+|---|---|
+| Run models or use LocalX | [Install the applications](https://github.com/C0deGeek-dev/LocalPilot#install-localx) |
+| Reuse model and launch definitions in Rust | `localx-llama-core` |
+| Integrate runtime and process management | `localx-llama-runtime` |
+| Reuse benchmark and grading primitives | `localx-eval-core` |
+
+**This repository is for developers.** The LocalX apps already include the
+libraries they need; there is no separate end-user installation. LocalBox,
+LocalBench, and LocalPilot consume these crates through pinned dependencies.
+
+## Which crate do I need?
 
 | Crate | Responsibility |
 |---|---|
 | `localx-llama-core` | Pure domain: model definitions, `llama-server` argv builder, per-build launch capabilities (read from a binary's `--help`), VRAM/quant-fit math, config precedence, tuner/AutoBest schema. No I/O. |
 | `localx-llama-runtime` | Process/network side behind cross-platform traits: server lifecycle, a bounded `--help` read for capability detection, a `llama-fit-params` runner, pin-verify + asset-selection *decision logic* (the HTTP fetch/install shell lives in the consuming app), CPU-only embed-serve, and the in-process no-think proxy (method/header-faithful forwarding + per-delta SSE `<think>` stripping). |
 | `localx-eval-core` | Evaluation primitives extracted from LocalPilot's harness: scorecard, blind judge, ablation, stack-detected grader, and the gated check runner (timeout, cancellation, a host reap hook for the whole process tree, bounded capture, environment policy). Shared by LocalPilot and LocalBench. |
+
+<details>
+<summary><strong>Runtime compatibility, memory fitting, and tuner versioning</strong></summary>
 
 llama.cpp builds disagree about launch flags: mainline replaced `--no-mmap` and
 `--mlock` with `--load-mode` and rejects the old spellings, while the forks keep
@@ -34,6 +55,8 @@ separate compatibility axes. Schema-1 files remain readable, but consumers
 only replay entries whose `tuner_version` matches the shared
 `CURRENT_TUNER_VERSION` constant; superseded measurements remain on disk for
 migration and diagnosis.
+
+</details>
 
 ## Consuming this repo
 
