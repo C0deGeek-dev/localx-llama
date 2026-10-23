@@ -27,6 +27,17 @@ LocalBench, and LocalPilot consume these crates through pinned dependencies.
 | `localx-llama-runtime` | Process/network side behind cross-platform traits: server lifecycle, a bounded `--help` read for capability detection, a `llama-fit-params` runner, pin-verify + asset-selection *decision logic* (the HTTP fetch/install shell lives in the consuming app), CPU-only embed-serve, and the in-process no-think proxy (method/header-faithful forwarding + per-delta SSE `<think>` stripping). |
 | `localx-eval-core` | Evaluation primitives extracted from LocalPilot's harness: scorecard, blind judge, ablation, stack-detected grader, and the gated check runner (timeout, cancellation, a host reap hook for the whole process tree, bounded capture, environment policy). Shared by LocalPilot and LocalBench. |
 
+The check runner can carry a host-owned `CommandProcessGuard` from its gated
+spawn through direct-child release and bounded cleanup confirmation. Hosts may
+reuse OS job/group owners without duplicating command preparation, permissions,
+timeouts or capture. The result distinguishes `NotStarted`, `Unverified` and
+`Confirmed` cleanup; exit0 and closed pipes never imply that descendants are gone.
+Existing hosts keep their original spawn/reap behaviour and report `Unverified`.
+A guard must terminate its owned tree on drop, including an abandoned execution
+future, and must return `Unverified` when drain cannot be established. Stop and
+confirmation hooks each have a five-second ceiling included in elapsed time;
+hosts composing a total deadline must budget those cleanup phases explicitly.
+
 <details>
 <summary><strong>Runtime compatibility, memory fitting, and tuner versioning</strong></summary>
 
