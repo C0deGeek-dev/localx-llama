@@ -45,7 +45,7 @@ anyhow = "=1.0.95"
 regex = "=1.11.3"
 sha2 = "=0.10.8"
 # async / http (in-process no-think proxy + endpoint probes)
-tokio = { version = "=1.44.2", features = ["macros", "rt-multi-thread", "process", "signal", "fs", "io-util", "io-std", "time", "sync", "net"] }
+tokio = { version = "=1.51.6", features = ["macros", "rt-multi-thread", "process", "signal", "fs", "io-util", "io-std", "time", "sync", "net"] }
 axum = "=0.7.9"
 hyper = { version = "=1.10.1", features = ["client", "server", "http1"] }
 hyper-util = { version = "=0.1.20", features = ["client", "client-legacy", "http1", "tokio"] }
