@@ -11,6 +11,7 @@
 
 use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -139,6 +140,17 @@ pub trait CommandGate {
     /// when the gate needs it.
     fn allow(&self, command: &CheckCommand) -> impl Future<Output = bool>;
 
+    /// Attach host-owned OS process-tree lifetime to the command prepared by the
+    /// shared runner. Called only after `allow`, never as an alternative runner.
+    /// Existing hosts retain their original unmanaged spawn and reap semantics.
+    ///
+    /// # Errors
+    /// Spawn/host ownership setup failure. Hosts must not fall back to running
+    /// an unmanaged child after an ownership setup failure.
+    fn spawn(&self, command: &mut tokio::process::Command) -> std::io::Result<ManagedCommand> {
+        command.spawn().map(ManagedCommand::unmanaged)
+    }
+
     /// Sanitize captured output before it becomes finding detail (e.g. secret
     /// redaction). The default keeps it as-is.
     fn sanitize(&self, text: String) -> String {
@@ -154,6 +166,55 @@ pub trait CommandGate {
         let _ = pid;
         std::future::ready(())
     }
+}
+
+/// Host-owned process lifetime. Drop must request tree termination even if the
+/// execution future is abandoned. Confirmation is separate: the shared runner
+/// releases its Child handle before asking whether the tree is empty.
+pub trait CommandProcessGuard: Send {
+    /// Request termination before killing/waiting the direct child. Signal
+    /// success alone must not be treated as proof that descendants are gone.
+    fn request_stop(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+    /// Confirm the owned job/group is empty after the direct Child handle was
+    /// released. Unknown/error/timeout must return Unverified, never Confirmed.
+    fn confirm_stopped(&mut self) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + '_>>;
+}
+
+/// Spawn result carrying the host's optional OS process ownership. All command,
+/// environment, timeout, capture and permission orchestration stays in the core.
+pub struct ManagedCommand {
+    child: tokio::process::Child,
+    guard: Option<Box<dyn CommandProcessGuard>>,
+}
+
+impl ManagedCommand {
+    /// Legacy child: the host's reap hook is best effort, not acknowledged proof.
+    #[must_use]
+    pub fn unmanaged(child: tokio::process::Child) -> Self {
+        Self { child, guard: None }
+    }
+
+    /// Child assigned to a host-owned process tree before any proposed code runs.
+    #[must_use]
+    pub fn owned(child: tokio::process::Child, guard: Box<dyn CommandProcessGuard>) -> Self {
+        Self {
+            child,
+            guard: Some(guard),
+        }
+    }
+}
+
+/// Explicit cleanup observation, independent of exit code or output-pipe closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CleanupOutcome {
+    /// Permission refusal/cancellation/spawn failure produced no running command.
+    NotStarted,
+    /// No ownership, a host error, incomplete drain, or confirmation timeout.
+    Unverified,
+    /// Host observed the owned process tree empty within the cleanup deadline.
+    Confirmed,
 }
 
 /// A gate that allows every command unchanged — for graders that run inside an
@@ -271,6 +332,9 @@ pub struct CommandRun {
     /// when the runner stopped waiting — an empty capture is then unproven,
     /// not clean.
     pub pipes_closed: bool,
+    /// Acknowledged process-tree observation. Legacy hosts remain Unverified;
+    /// an exit0 or closed output pipes alone never implies Confirmed cleanup.
+    pub cleanup: CleanupOutcome,
     /// The spawned process id, when it started.
     pub pid: Option<u32>,
     /// Wall-clock time from the gate's decision to the end.
@@ -285,6 +349,7 @@ impl CommandRun {
             stderr: String::new(),
             truncated: false,
             pipes_closed: true,
+            cleanup: CleanupOutcome::NotStarted,
             pid: None,
             elapsed: started.elapsed(),
         }
@@ -469,8 +534,11 @@ impl<'a, G: CommandGate> CheckRunner<'a, G> {
         #[cfg(unix)]
         process.process_group(0);
 
-        let mut child = match process.spawn() {
-            Ok(child) => child,
+        let ManagedCommand {
+            mut child,
+            mut guard,
+        } = match self.gate.spawn(&mut process) {
+            Ok(managed) => managed,
             Err(error) => {
                 return CommandRun::without_process(
                     CommandEnd::NotStarted(format!("failed to start {}: {error}", command.program)),
@@ -500,22 +568,38 @@ impl<'a, G: CommandGate> CheckRunner<'a, G> {
             () = cancelled => CommandEnd::Cancelled,
         };
         let stopped = matches!(end, CommandEnd::TimedOut | CommandEnd::Cancelled);
-        if stopped {
+        let owned = guard.is_some();
+        if let Some(guard) = guard.as_mut() {
+            // Retain ownership across stop and Child release. The guard's Drop
+            // remains the final fallback on cancellation of this future.
+            let _ = tokio::time::timeout(CLEANUP_GRACE, guard.request_stop()).await;
+        } else if stopped {
             // The tree first, while the child still exists to be walked from;
             // then the child itself, whatever the reap managed.
             if let Some(pid) = pid {
                 self.gate.reap(pid).await;
             }
+        }
+        if stopped {
             let _ = child.start_kill();
             let _ = tokio::time::timeout(PIPE_GRACE, child.wait()).await;
         }
+        // Windows job accounting can conservatively retain exited processes
+        // while handles remain open. Never wait for job drain holding our Child.
+        drop(child);
+        let cleanup = match guard.as_mut() {
+            Some(guard) => tokio::time::timeout(CLEANUP_GRACE, guard.confirm_stopped())
+                .await
+                .unwrap_or(CleanupOutcome::Unverified),
+            None => CleanupOutcome::Unverified,
+        };
 
         // A grandchild that inherited a pipe keeps it open after the child is
         // gone, so the readers are given a grace, not an unbounded wait.
         let stdout_closed = stdout.finish(PIPE_GRACE).await;
         let stderr_closed = stderr.finish(PIPE_GRACE).await;
         let pipes_closed = stdout_closed && stderr_closed;
-        if !pipes_closed && !stopped {
+        if !pipes_closed && !stopped && !owned {
             // The command exited but something it started is still writing.
             if let Some(pid) = pid {
                 self.gate.reap(pid).await;
@@ -529,6 +613,7 @@ impl<'a, G: CommandGate> CheckRunner<'a, G> {
             stderr: bound(self.gate.sanitize(err)),
             truncated: out_truncated || err_truncated,
             pipes_closed,
+            cleanup,
             pid,
             elapsed: started.elapsed(),
         }
@@ -538,6 +623,8 @@ impl<'a, G: CommandGate> CheckRunner<'a, G> {
 /// How long the readers are given to see a pipe close once the command has
 /// ended or been stopped.
 const PIPE_GRACE: Duration = Duration::from_secs(2);
+/// Bound each host stop/drain hook; elapsed time includes both cleanup phases.
+const CLEANUP_GRACE: Duration = Duration::from_secs(5);
 
 /// Bytes kept from each output stream; the rest is read and discarded so the
 /// command never blocks on a full pipe.
@@ -633,6 +720,132 @@ fn bound(mut text: String) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    struct OwnedGate {
+        allowed: bool,
+        confirmed: bool,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    struct ObservedGuard {
+        confirmed: bool,
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for ObservedGuard {
+        fn drop(&mut self) {
+            self.events.lock().unwrap().push("drop");
+        }
+    }
+
+    impl CommandProcessGuard for ObservedGuard {
+        fn request_stop(&mut self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push("stop");
+            })
+        }
+        fn confirm_stopped(&mut self) -> Pin<Box<dyn Future<Output = CleanupOutcome> + Send + '_>> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push("confirm");
+                if self.confirmed {
+                    CleanupOutcome::Confirmed
+                } else {
+                    CleanupOutcome::Unverified
+                }
+            })
+        }
+    }
+
+    impl CommandGate for OwnedGate {
+        fn allow(&self, _command: &CheckCommand) -> impl Future<Output = bool> {
+            self.events.lock().unwrap().push("allow");
+            std::future::ready(self.allowed)
+        }
+        fn spawn(&self, command: &mut tokio::process::Command) -> std::io::Result<ManagedCommand> {
+            self.events.lock().unwrap().push("spawn");
+            command.spawn().map(|child| {
+                ManagedCommand::owned(
+                    child,
+                    Box::new(ObservedGuard {
+                        confirmed: self.confirmed,
+                        events: self.events.clone(),
+                    }),
+                )
+            })
+        }
+        fn reap(&self, _pid: u32) -> impl Future<Output = ()> {
+            self.events.lock().unwrap().push("legacy-reap");
+            std::future::ready(())
+        }
+    }
+
+    #[tokio::test]
+    async fn ownership_spawn_never_bypasses_permission_and_cleanup_is_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = OwnedGate {
+            allowed: false,
+            confirmed: true,
+            events: Arc::default(),
+        };
+        let result = CheckRunner::new(&gate, dir.path())
+            .execute(&exit_with(0))
+            .await;
+        assert_eq!(result.end, CommandEnd::Denied);
+        assert_eq!(result.cleanup, CleanupOutcome::NotStarted);
+        assert_eq!(*gate.events.lock().unwrap(), ["allow"]);
+        for confirmed in [false, true] {
+            let gate = OwnedGate {
+                allowed: true,
+                confirmed,
+                events: Arc::default(),
+            };
+            let result = CheckRunner::new(&gate, dir.path())
+                .execute(&exit_with(0))
+                .await;
+            assert!(matches!(
+                result.end,
+                CommandEnd::Exited { success: true, .. }
+            ));
+            assert_eq!(
+                result.cleanup,
+                if confirmed {
+                    CleanupOutcome::Confirmed
+                } else {
+                    CleanupOutcome::Unverified
+                }
+            );
+            assert_eq!(
+                *gate.events.lock().unwrap(),
+                ["allow", "spawn", "stop", "confirm", "drop"]
+            );
+        }
+        let legacy = CheckRunner::new(&AllowAll, dir.path())
+            .execute(&exit_with(0))
+            .await;
+        assert_eq!(
+            legacy.cleanup,
+            CleanupOutcome::Unverified,
+            "exit0/pipes do not invent legacy cleanup proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoning_execution_drops_host_ownership_without_claiming_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = OwnedGate {
+            allowed: true,
+            confirmed: true,
+            events: Arc::default(),
+        };
+        let runner = CheckRunner::new(&gate, dir.path());
+        let command = start_then_hang();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), runner.execute(&command))
+                .await
+                .is_err()
+        );
+        assert_eq!(*gate.events.lock().unwrap(), ["allow", "spawn", "drop"]);
+    }
 
     /// A gate that refuses everything.
     struct DenyAll;
