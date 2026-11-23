@@ -292,6 +292,11 @@ pub struct LaunchParams {
     pub flash_attn: Option<bool>,
     /// Emit `--swa-full`.
     pub swa_full: bool,
+    /// Emit `--no-op-offload` when `Some(true)`: keep host tensor operations
+    /// (MoE experts held in system memory) on the CPU instead of staging their
+    /// weights through the GPU. It removes a large per-batch compute buffer, so
+    /// it decides whether a long context fits.
+    pub no_op_offload: Option<bool>,
     /// Emit `--cache-prompt` when `Some(true)`.
     pub cache_prompt: Option<bool>,
     /// Multi-GPU split mode.
@@ -455,6 +460,9 @@ pub fn build_llama_server_args(
     }
     if p.swa_full {
         a.push("--swa-full".to_string());
+    }
+    if p.no_op_offload == Some(true) {
+        a.push("--no-op-offload".to_string());
     }
     if p.cache_prompt == Some(true) {
         a.push("--cache-prompt".to_string());
@@ -656,6 +664,23 @@ mod tests {
         // per-model extra args before per-call.
         assert!(j.ends_with("--from-def --from-call"));
         // ub<=b NOT enforced: both emitted verbatim even if equal.
+    }
+
+    #[test]
+    fn no_op_offload_is_emitted_only_when_asked_for() {
+        let d = base_def();
+        let build = |no_op_offload| {
+            let p = LaunchParams {
+                no_op_offload,
+                ..Default::default()
+            };
+            build_llama_server_args(&d, "", Mode::Native, "m.gguf", 8080, &p)
+                .unwrap()
+                .join(" ")
+        };
+        assert!(build(Some(true)).contains("--no-op-offload"));
+        assert!(!build(Some(false)).contains("op-offload"));
+        assert!(!build(None).contains("op-offload"));
     }
 
     #[test]

@@ -88,6 +88,9 @@ pub struct Overrides {
     /// `--swa-full`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub swa_full: Option<bool>,
+    /// `--no-op-offload`: host tensor operations stay on the CPU.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_op_offload: Option<bool>,
     /// `--cache-prompt`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_prompt: Option<bool>,
@@ -132,6 +135,7 @@ impl Overrides {
             threads_batch: self.threads_batch,
             flash_attn: self.flash_attn,
             swa_full: self.swa_full.unwrap_or(false),
+            no_op_offload: self.no_op_offload,
             cache_prompt: self.cache_prompt,
             split_mode: self.split_mode.clone(),
             chat_template_override: None,
@@ -278,6 +282,20 @@ mod tests {
         assert_eq!(lp.batch_size, Some(1024));
         assert_eq!(lp.flash_attn, Some(true));
         assert_eq!(lp.kv_k.as_deref(), Some("q8_0"));
+    }
+
+    #[test]
+    fn no_op_offload_survives_the_stored_profile_and_reaches_the_launch() {
+        let o: Overrides = serde_json::from_str(r#"{"NCpuMoe":44,"NoOpOffload":true}"#).unwrap();
+        assert_eq!(o.no_op_offload, Some(true));
+        assert!(serde_json::to_string(&o)
+            .unwrap()
+            .contains("\"NoOpOffload\":true"));
+        assert_eq!(o.to_launch_params().no_op_offload, Some(true));
+        // Absent stays absent, so an older profile replays unchanged.
+        let old: Overrides = serde_json::from_str(r#"{"NCpuMoe":44}"#).unwrap();
+        assert_eq!(old.to_launch_params().no_op_offload, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("NoOpOffload"));
     }
 
     #[test]

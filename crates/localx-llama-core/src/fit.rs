@@ -52,6 +52,7 @@ const MEMORY_SWITCHES: &[&str] = &[
     "--kv-unified",
     "-nkvo",
     "--no-kv-offload",
+    "--no-op-offload",
 ];
 
 /// Placement flags the fitter decides itself. Passing any of them makes it
@@ -138,6 +139,22 @@ impl FitPlacement {
     }
 }
 
+impl FitPlacement {
+    /// Whether the placement keeps every layer on the device and only moves MoE
+    /// experts to system memory, which is the one shape `--n-cpu-moe` can
+    /// reproduce. The fitter may instead keep fewer layers on the device; then
+    /// the expert-block count alone says nothing about where the model went.
+    /// `total_layers` is the repeating-layer count plus the output layer.
+    #[must_use]
+    pub fn is_expert_offload_only(&self, total_layers: Option<i64>) -> bool {
+        match (self.gpu_layers, total_layers) {
+            (layers, _) if layers < 0 => true,
+            (layers, Some(total)) => layers >= total,
+            (_, None) => true,
+        }
+    }
+}
+
 /// One device's share of a fitted placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceFit {
@@ -149,8 +166,9 @@ pub struct DeviceFit {
     pub overflowing: u32,
     /// Projected device memory in use.
     pub used_mib: u64,
-    /// Projected device memory left free.
-    pub free_mib: u64,
+    /// Projected device memory left free. Negative when the projection needs
+    /// more than the device has.
+    pub free_mib: i64,
 }
 
 /// Why fitter output could not be read as a placement.
@@ -160,6 +178,13 @@ pub enum FitError {
     Failed(String),
     /// Standard output did not contain a fitted argument line.
     Unrecognised,
+    /// The fitter ran and found no placement that keeps the model on the
+    /// device: it fell back to `-ngl 0`. Nothing about the launch shape fits,
+    /// so no placement exists to start from.
+    NoPlacement {
+        /// How much more device memory the shape needs, when the log said.
+        deficit_mib: Option<u64>,
+    },
 }
 
 impl fmt::Display for FitError {
@@ -167,6 +192,15 @@ impl fmt::Display for FitError {
         match self {
             Self::Failed(reason) => write!(f, "llama-fit-params failed: {reason}"),
             Self::Unrecognised => f.write_str("llama-fit-params output was not recognised"),
+            Self::NoPlacement {
+                deficit_mib: Some(deficit),
+            } => write!(
+                f,
+                "llama-fit-params found no placement: this shape needs {deficit} MiB more device memory"
+            ),
+            Self::NoPlacement { deficit_mib: None } => {
+                f.write_str("llama-fit-params found no placement for this shape")
+            }
         }
     }
 }
@@ -192,6 +226,15 @@ pub fn parse_fit_output(stdout: &str, log: &str) -> Result<FitPlacement, FitErro
     };
     let context = value_of(&["-c"]).and_then(|v| v.parse::<i64>().ok());
     let tensor_overrides = value_of(&["-ot"]).cloned();
+    // `-ngl 0` with no tensor override is the fitter's fallback when not even
+    // the dense weights, the context and the compute buffer fit: it is not a
+    // placement. (A host with no usable device prints it too; that has no
+    // placement either.)
+    if gpu_layers == 0 && tensor_overrides.is_none() {
+        return Err(FitError::NoPlacement {
+            deficit_mib: deficit(log),
+        });
+    }
     let cpu_expert_blocks = tensor_overrides
         .as_deref()
         .map(cpu_blocks)
@@ -272,7 +315,7 @@ fn device_fit(line: &str) -> Option<DeviceFit> {
         .and_then(|(n, _)| n.trim().parse().ok())
         .unwrap_or(0);
     let used_mib = number_before(rest, " MiB used")?;
-    let free_mib = number_before(rest, " MiB free")?;
+    let free_mib = signed_number_before(rest, " MiB free")?;
     Some(DeviceFit {
         name,
         layers,
@@ -288,6 +331,33 @@ fn number_before(text: &str, marker: &str) -> Option<u64> {
         .rsplit(|c: char| !c.is_ascii_digit())
         .next()
         .and_then(|n| n.parse().ok())
+}
+
+/// Like [`number_before`], keeping a leading minus: the fitter prints a
+/// shortfall as negative free memory.
+fn signed_number_before(text: &str, marker: &str) -> Option<i64> {
+    let (before, _) = text.split_once(marker)?;
+    before
+        .rsplit(|c: char| !(c.is_ascii_digit() || c == '-'))
+        .next()
+        .and_then(|n| n.parse().ok())
+}
+
+/// The shortfall the fitter reports, in MiB: the line it logs when even the
+/// dense weights do not fit, else the last device's negative free memory.
+fn deficit(log: &str) -> Option<u64> {
+    const MARKER: &str = "total deficit of ";
+    let logged = log.lines().rev().find_map(|line| {
+        let (_, rest) = line.split_once(MARKER)?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    });
+    logged.or_else(|| {
+        device_fits(log)
+            .last()
+            .and_then(|device| u64::try_from(device.free_mib.checked_neg()?).ok())
+            .filter(|short| *short > 0)
+    })
 }
 
 /// The first error line the fitter logged, without its timestamp prefix.
@@ -371,6 +441,77 @@ mod tests {
         assert!(fit.cpu_expert_blocks.is_empty());
         assert_eq!(fit.n_cpu_moe(), 0);
         assert!(fit.devices.is_empty());
+    }
+
+    /// Real output of a native build fitting a 48-block MoE at 256k with the
+    /// default batch on a 16 GB card: nothing fits, so it prints `-ngl 0`.
+    const NO_FIT_LOG: &str = "\
+0.00.951.810 I common_params_fit_impl: with only dense weights in device memory there is still a total deficit of 29819 MiB
+0.22.227.543 I common_params_fit_impl:   - CUDA0 (NVIDIA GeForce RTX 4090 Laptop GPU):  0 layers,  38932 MiB used, -23858 MiB free
+";
+
+    #[test]
+    fn a_fit_that_keeps_nothing_on_the_device_is_not_a_placement() {
+        assert_eq!(
+            parse_fit_output("-c 262144 -ngl 0\n", NO_FIT_LOG),
+            Err(FitError::NoPlacement {
+                deficit_mib: Some(29819)
+            })
+        );
+        assert!(parse_fit_output("-c 262144 -ngl 0\n", "")
+            .unwrap_err()
+            .to_string()
+            .contains("no placement"));
+    }
+
+    #[test]
+    fn without_a_deficit_line_the_negative_free_memory_is_the_shortfall() {
+        let log = "0.22.227.543 I common_params_fit_impl:   - CUDA0 (NVIDIA GeForce RTX 4090 Laptop GPU):  0 layers,  38932 MiB used, -23858 MiB free\n";
+        assert_eq!(
+            parse_fit_output("-c 262144 -ngl 0\n", log),
+            Err(FitError::NoPlacement {
+                deficit_mib: Some(23858)
+            })
+        );
+        assert_eq!(
+            parse_fit_output("-c 262144 -ngl 0\n", ""),
+            Err(FitError::NoPlacement { deficit_mib: None })
+        );
+    }
+
+    #[test]
+    fn a_shortfall_keeps_its_sign_in_the_device_summary() {
+        let fits = device_fits(NO_FIT_LOG);
+        assert_eq!(fits.len(), 1);
+        assert_eq!(fits[0].free_mib, -23858);
+        assert_eq!(fits[0].used_mib, 38932);
+    }
+
+    /// The same model at the same context with `-ub 256 --no-op-offload`: the
+    /// fitter keeps only seven layers on the device (abridged `-ot`).
+    const PARTIAL_STDOUT: &str = r#"-c 262144 -ngl 7 -ot "blk\.43\.ffn_(up|down|gate_up|gate)_(ch|)exps=CPU,blk\.44\.ffn_(up|down|gate_up|gate)_(ch|)exps=CPU,blk\.48\.ffn_(up|down|gate_up|gate)_(ch|)exps=CPU""#;
+
+    #[test]
+    fn a_fit_with_fewer_layers_is_not_an_expert_offload_only_placement() {
+        let fit = parse_fit_output(PARTIAL_STDOUT, "").unwrap();
+        assert_eq!(fit.gpu_layers, 7);
+        assert_eq!(fit.n_cpu_moe(), 3);
+        assert!(!fit.is_expert_offload_only(Some(49)));
+        // The MoE fit above keeps all 49 layers on the device.
+        let moe = parse_fit_output(MOE_STDOUT, MOE_LOG).unwrap();
+        assert!(moe.is_expert_offload_only(Some(49)));
+        assert!(moe.is_expert_offload_only(None));
+        let whole = parse_fit_output("-c 65536 -ngl -1\n", "").unwrap();
+        assert!(whole.is_expert_offload_only(Some(49)));
+    }
+
+    #[test]
+    fn the_fitter_sees_whether_host_operations_are_offloaded() {
+        let server = argv("-m m.gguf -c 262144 -ngl 999 --no-op-offload -ub 128");
+        assert_eq!(
+            fit_params_args(&server, 1024),
+            argv("-m m.gguf -c 262144 --no-op-offload -ub 128 --fit-target 1024")
+        );
     }
 
     #[test]
