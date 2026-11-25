@@ -44,7 +44,17 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         assert!(is_port_listening(port)); // OS accepts into the backlog
         assert!(!is_port_free(port)); // in use
+    }
+
+    #[test]
+    fn a_dropped_listener_frees_its_port() {
+        // No connection is made here: a connection that was queued on the
+        // listener can leave the port in a closing state for a moment on some
+        // systems, which is the OS's business, not this check's.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(!is_port_free(port));
         drop(listener);
-        assert!(is_port_free(port)); // released
+        assert!(is_port_free(port));
     }
 }
