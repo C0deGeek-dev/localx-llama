@@ -16,7 +16,7 @@ shared source, tests, and public developer documentation.
   trip real fixtures; the proxy has method/header/SSE contract tests. A change to
   a carried behaviour updates its golden test in the same commit — never delete a
   golden assertion to make a diff pass.
-- **Engineering rules:** MSRV 1.82, edition 2021, exact-pinned workspace deps,
+- **Engineering rules:** MSRV 1.89, edition 2021, exact-pinned workspace deps,
   `#![forbid(unsafe_code)]` (use safe platform APIs like `creation_flags` /
   `process_group`, never `pre_exec`), no `unwrap`/`expect`/`todo`/`dbg` outside
   `#[cfg(test)]`. Windows / Linux / macOS are equal tier-1 (ADR-0007).

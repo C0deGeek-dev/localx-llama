@@ -6,7 +6,7 @@
 #   - localx-eval-core      extracted eval primitives (scorecard/judge/ablation, grader)
 #
 # Consumed by the product repos via a rev-pinned Cargo git dependency (not a
-# submodule). MSRV 1.82 / edition 2021, exact-pinned deps — matches the stack.
+# submodule). MSRV 1.89 / edition 2021, exact-pinned deps — matches the stack.
 
 [workspace]
 resolver = "2"
@@ -21,7 +21,7 @@ edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 authors = ["David <David@c0degeek.dev>", "Bram (C0deGeek.dev)"]
 repository = "https://github.com/C0deGeek-dev/localx-llama"
-rust-version = "1.82"
+rust-version = "1.89"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -32,8 +32,8 @@ expect_used = "deny"
 todo = "deny"
 dbg_macro = "deny"
 
-# Exact-pinned, MSRV-1.82-verified. The proxy set (axum/hyper/hyper-util/
-# http-body-util/tower/bytes/futures) was spike-built + run on 1.82 before pinning.
+# Exact-pinned and verified on the MSRV. The proxy set (axum/hyper/hyper-util/
+# http-body-util/tower/bytes/futures) was spike-built and run before pinning.
 # The rest mirror LocalPilot's vetted pins.
 [workspace.dependencies]
 # core / serde

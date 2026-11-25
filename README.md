@@ -84,7 +84,7 @@ velocity; the rev is pinned at each checkpoint.
 
 ## Toolchain
 
-MSRV **1.82**, edition **2021**, exact-pinned workspace deps, `#![forbid(unsafe_code)]`.
+MSRV **1.89**, edition **2021**, exact-pinned workspace deps, `#![forbid(unsafe_code)]`.
 Windows / Linux / macOS are equal tier-1 (matches the stack's ADR-0007).
 
 ```
